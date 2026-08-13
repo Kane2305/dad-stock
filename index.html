@@ -144,16 +144,30 @@
    Firebase 只在「雲端同步」時才載入；沒有網路一樣可以正常記帳
    ======================================================================= */
 
-/* ---------- 設定區：把 Firebase 設定值貼在這裡 ---------- */
-var FIREBASE_CONFIG = {
-  apiKey: "AIzaSyCWMyYsD6-oCIoZ06BlZO3CqwcCKYyWvLY",
-  authDomain: "dad-stock-ledger.firebaseapp.com",
-  projectId: "dad-stock-ledger",
-  storageBucket: "dad-stock-ledger.firebasestorage.app",
-  messagingSenderId: "557953822199",
-  appId: "1:557953822199:web:0ab25817e2141aeea6d2f2"
-};
-var FIREBASE_READY = FIREBASE_CONFIG.apiKey !== "REPLACE_ME";
+/* ---------- Firebase 設定：從瀏覽器本機讀取，透過「設定」介面貼上，不用改程式碼 ---------- */
+var FB_CONFIG_KEY = "dadstock_firebase_config";
+function loadFirebaseConfig(){
+  try{
+    var raw = localStorage.getItem(FB_CONFIG_KEY);
+    if(!raw) return null;
+    var cfg = JSON.parse(raw);
+    if(cfg && cfg.apiKey && cfg.projectId) return cfg;
+  }catch(e){}
+  return null;
+}
+var FIREBASE_CONFIG = loadFirebaseConfig();
+var FIREBASE_READY = !!FIREBASE_CONFIG;
+
+var FB_REQUIRED_KEYS = ["apiKey","authDomain","projectId","storageBucket","messagingSenderId","appId"];
+function parseFirebaseConfigText(text){
+  var out = {}, missing = [];
+  FB_REQUIRED_KEYS.forEach(function(k){
+    var re = new RegExp('["\']?'+k+'["\']?\\s*:\\s*["\']([^"\']+)["\']');
+    var m = text.match(re);
+    if(m) out[k] = m[1]; else missing.push(k);
+  });
+  return { config: out, missing: missing };
+}
 
 /* ---------- 內建標的清單 ---------- */
 var SEED_STOCKS = [
@@ -280,6 +294,31 @@ function loadFirebaseScripts(cb){
   next();
 }
 
+function reinitFirebaseApp(){
+  if(typeof firebase!=="undefined" && firebase.apps && firebase.apps.length){
+    firebase.apps.slice().forEach(function(a){ try{ a.delete(); }catch(e){} });
+  }
+}
+
+function saveFirebaseConfig(cfg){
+  FIREBASE_CONFIG = cfg;
+  FIREBASE_READY = true;
+  localStorage.setItem(FB_CONFIG_KEY, JSON.stringify(cfg));
+  fbReadyLoaded = false; // 需要用新設定重新初始化
+  reinitFirebaseApp();
+}
+function clearFirebaseConfig(){
+  if(fbUnsub){ fbUnsub(); fbUnsub=null; }
+  reinitFirebaseApp();
+  localStorage.removeItem(FB_CONFIG_KEY);
+  localStorage.removeItem(CODE_KEY);
+  FIREBASE_CONFIG = null;
+  FIREBASE_READY = false;
+  fbReadyLoaded = false;
+  STATE.syncCode = "";
+  STATE.syncStatus = "idle";
+}
+
 function startSync(){
   if(!FIREBASE_READY || !STATE.syncCode) return;
   STATE.syncStatus="connecting"; render();
@@ -322,7 +361,107 @@ function pushCloud(){
 }
 function commit(){ saveLocal(); pushCloud(); render(); }
 
-/* ---------- SVG 折線圖（自行繪製，不用外部套件） ---------- */
+/* ---------- 標的管理：刪除、清除 ---------- */
+function txnCountFor(stockId){
+  var n=0;
+  for(var i=0;i<STATE.txns.length;i++) if(STATE.txns[i].stockId===stockId) n++;
+  return n;
+}
+function deleteStock(stockId, cascade){
+  STATE.stocks = STATE.stocks.filter(function(s){ return s.id!==stockId; });
+  if(cascade){
+    STATE.txns = STATE.txns.filter(function(t){ return t.stockId!==stockId; });
+  }
+  commit();
+}
+function clearUnusedStocks(){
+  var used={};
+  for(var i=0;i<STATE.txns.length;i++) used[STATE.txns[i].stockId]=true;
+  var removed = STATE.stocks.filter(function(s){ return !used[s.id]; }).length;
+  STATE.stocks = STATE.stocks.filter(function(s){ return used[s.id]; });
+  commit();
+  return removed;
+}
+function clearAllRecords(){
+  STATE.txns = [];
+  commit();
+}
+
+/* ---------- 從 Excel 貼上匯入 ---------- */
+function normalizeDate(raw){
+  var s = String(raw).trim().replace(/\//g,"-").replace(/-+/g,"-");
+  var m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if(!m) return null;
+  var y=m[1], mo=String(m[2]).padStart(2,"0"), da=String(m[3]).padStart(2,"0");
+  var d = new Date(y+"-"+mo+"-"+da);
+  if(isNaN(d.getTime())) return null;
+  if(d.getFullYear()!=y || (d.getMonth()+1)!=Number(mo) || d.getDate()!=Number(da)) return null;
+  return y+"-"+mo+"-"+da;
+}
+function normalizeType(raw){
+  var s = String(raw).trim();
+  if(/買|buy/i.test(s)) return "buy";
+  if(/賣|sell/i.test(s)) return "sell";
+  return null;
+}
+function splitCols(line){
+  if(line.indexOf("\t")>-1) return line.split("\t").map(function(x){return x.trim();});
+  return line.split(",").map(function(x){return x.trim();});
+}
+
+function parseImportText(text){
+  var lines = text.split(/\r?\n/).map(function(l){return l.trim();}).filter(function(l){return l.length>0;});
+  var rows=[], errors=[], newStockNames=[];
+  var existingByName = {};
+  STATE.stocks.forEach(function(s){ existingByName[s.name]=s; });
+
+  for(var i=0;i<lines.length;i++){
+    var cols = splitCols(lines[i]);
+    if(cols.length<5){
+      errors.push("第 "+(i+1)+" 行：欄位數不足（需要至少 5 欄），已略過");
+      continue;
+    }
+    var date = normalizeDate(cols[0]);
+    var name = cols[1];
+    var type = normalizeType(cols[2]);
+    var price = parseFloat(cols[3]);
+    var shares = parseFloat(cols[4]);
+    var costWithTax = cols.length>=7 ? parseFloat(cols[6]) : (cols.length===6 ? parseFloat(cols[5]) : NaN);
+
+    if(!date){ errors.push("第 "+(i+1)+" 行：日期格式看不懂「"+cols[0]+"」，已略過"); continue; }
+    if(!name){ errors.push("第 "+(i+1)+" 行：標的名稱是空的，已略過"); continue; }
+    if(!type){ errors.push("第 "+(i+1)+" 行：買賣別看不出來「"+cols[2]+"」，已略過"); continue; }
+    if(!price || price<=0){ errors.push("第 "+(i+1)+" 行：價格不是有效數字，已略過"); continue; }
+    if(!shares || shares<=0){ errors.push("第 "+(i+1)+" 行：股數不是有效數字，已略過"); continue; }
+    if(isNaN(costWithTax) || costWithTax<=0){ costWithTax = price*shares; }
+
+    if(!existingByName[name] && newStockNames.indexOf(name)===-1){
+      newStockNames.push(name);
+    }
+    rows.push({date:date, name:name, type:type, price:price, shares:shares, costWithTax:costWithTax});
+  }
+  return { rows:rows, errors:errors, newStockNames:newStockNames };
+}
+
+function commitImport(rows, newStockNames){
+  var byName={};
+  STATE.stocks.forEach(function(s){ byName[s.name]=s; });
+  newStockNames.forEach(function(n){
+    if(!byName[n]){
+      var s={id:uid("s"), name:n, code:""};
+      STATE.stocks.push(s);
+      byName[n]=s;
+    }
+  });
+  rows.forEach(function(r, idx){
+    STATE.txns.push({
+      id: uid("t"), stockId: byName[r.name].id, type:r.type,
+      date:r.date, shares:r.shares, price:r.price, costWithTax:r.costWithTax,
+      createdAt: Date.now()+idx
+    });
+  });
+  commit();
+}
 function lineChartSVG(points){
   if(points.length===0) return "";
   var W=640,H=220,PL=64,PR=16,PT=16,PB=32;
@@ -767,14 +906,16 @@ function settingsModal(){
 
   if(!FIREBASE_READY){
     body += '<div class="warn" style="background:var(--paper-deep);color:var(--ink-soft);margin:0 0 14px">'
-      + '目前是<b>本機模式</b>：資料存在這台裝置的瀏覽器裡，可以正常使用所有功能，但不會同步到其他裝置。<br><br>'
-      + '要開啟雲端同步，請照《Firebase設定教學》把設定值填進程式碼最上面的 FIREBASE_CONFIG，存檔後重新整理。</div>';
+      + '目前是<b>本機模式</b>：資料存在這台裝置的瀏覽器裡，可以正常使用所有功能，但不會同步到其他裝置。</div>'
+      + '<button class="btn btn-p btn-blk" data-act="openfbsetup">設定雲端同步</button>';
   }else if(!STATE.syncCode){
     body += '<p class="muted" style="margin-top:0">建立一組同步代碼，之後在其他裝置輸入同一組代碼，就能看到同一份資料。</p>'
       + '<button class="btn btn-p btn-blk" data-act="newroom">建立新的同步代碼</button>'
       + '<div style="height:16px"></div>'
       + '<div class="field"><label>已經有同步代碼？在這裡輸入</label><input id="f_code" placeholder="貼上代碼"></div>'
-      + '<button class="btn btn-g btn-blk" data-act="joinroom">連線</button>';
+      + '<button class="btn btn-g btn-blk" data-act="joinroom">連線</button>'
+      + '<div style="height:6px"></div>'
+      + '<span class="addlink" data-act="openfbsetup">重新設定雲端連線</span>';
   }else{
     var st = STATE.syncStatus==="connected" ? "✅ 已連線"
            : STATE.syncStatus==="error" ? "❌ 連線失敗（資料仍在本機）" : "連線中…";
@@ -786,8 +927,76 @@ function settingsModal(){
   }
 
   body += '<div class="srow" style="margin-top:18px"><span class="muted">交易筆數</span><span>'+STATE.txns.length+' 筆</span></div>'
-    + '<button class="btn btn-g btn-blk" style="margin-top:14px" data-act="export">匯出備份檔</button>';
+    + '<div class="srow"><span class="muted">標的數</span><span>'+STATE.stocks.length+' 檔</span></div>';
 
+  body += '<div style="margin-top:16px;display:flex;flex-direction:column;gap:8px">'
+    + '<button class="btn btn-g btn-blk" data-act="openimport">從 Excel 貼上匯入交易</button>'
+    + '<button class="btn btn-g btn-blk" data-act="openstockmanage">管理標的清單</button>'
+    + '<button class="btn btn-g btn-blk" data-act="export">匯出備份檔</button>'
+    + '</div>';
+
+  body += '<div style="margin-top:20px;padding-top:16px;border-top:1px solid var(--line)">'
+    + '<div class="muted" style="margin-bottom:8px">危險區域</div>'
+    + '<button class="btn btn-blk" style="background:#FBEAE8;color:var(--gain)" data-act="nukeall">清除所有交易紀錄</button>'
+    + '</div>';
+
+  if(FIREBASE_READY){
+    body += '<div style="margin-top:10px">'
+      + '<span class="addlink" style="color:var(--ink-soft);text-decoration:underline" data-act="clearfbconfig">清除雲端設定（改連別的 Firebase 專案）</span>'
+      + '</div>';
+  }
+
+  openModal(body);
+}
+
+/* ---------- 子面板：Firebase 雲端設定 ---------- */
+function firebaseSetupModal(){
+  var body = '<button class="x" data-act="close">✕</button><h3 class="mtitle">設定雲端同步</h3>'
+    + '<div class="warn" style="background:var(--paper-deep);color:var(--ink-soft);margin-bottom:14px">'
+    + '這步驟只需要做一次。到 <b>Firebase 主控台</b> 註冊網頁應用程式後，畫面上會有一段設定程式碼，'
+    + '<b>選「使用 &lt;script&gt; 標籤」／CDN 方式</b>（不要選 npm，那是給用建置工具的工程師用的，我們這個網頁不需要），'
+    + '把整段 <code>const firebaseConfig = {...}</code> 複製起來，貼到下面。詳細步驟見《Firebase設定教學》。</div>'
+    + '<div class="field"><label>貼上你從 Firebase 複製的設定程式碼</label>'
+    + '<textarea id="f_fbraw" rows="7" style="width:100%;padding:11px 12px;border-radius:10px;border:1px solid var(--line);font-family:ui-monospace,monospace;font-size:12.5px;" placeholder=\'const firebaseConfig = {\n  apiKey: "...",\n  authDomain: "...",\n  ...\n};\'></textarea></div>'
+    + '<div id="fbparse_result"></div>'
+    + '<div class="acts"><button class="btn btn-g btn-blk" data-act="close">取消</button>'
+    + '<button class="btn btn-p btn-blk" data-act="parsefb">解析並儲存</button></div>';
+  openModal(body);
+}
+
+/* ---------- 子面板：標的管理 ---------- */
+function stockManageModal(){
+  var rows="";
+  var sorted = STATE.stocks.slice().sort(function(a,b){ return a.name.localeCompare(b.name,"zh-Hant"); });
+  for(var i=0;i<sorted.length;i++){
+    var s=sorted[i];
+    var n=txnCountFor(s.id);
+    rows += '<div class="srow">'
+      + '<div><div style="font-weight:700;font-size:14px">'+esc(s.name)
+      + (s.code?'<span class="scode">'+esc(s.code)+'</span>':'')+'</div>'
+      + '<div class="muted">'+(n>0?n+' 筆紀錄':'沒有紀錄')+'</div></div>'
+      + '<span class="del" data-delstock="'+s.id+'" data-count="'+n+'" data-name="'+esc(s.name)+'">刪除</span>'
+      + '</div>';
+  }
+  if(!rows) rows = '<div class="muted" style="padding:14px 2px">目前沒有任何標的</div>';
+
+  var body = '<button class="x" data-act="close">✕</button><h3 class="mtitle">管理標的清單</h3>'
+    + '<p class="muted" style="margin-top:0">點「刪除」可以移除單一標的；有紀錄的標的會一併刪除它的所有交易紀錄。</p>'
+    + '<div class="card" style="padding:2px 12px;max-height:340px;overflow-y:auto">'+rows+'</div>'
+    + '<button class="btn btn-g btn-blk" style="margin-top:14px" data-act="clearunused">清除所有「沒有紀錄」的標的</button>'
+    + '<button class="btn btn-g btn-blk" style="margin-top:10px" data-act="close">關閉</button>';
+  openModal(body);
+}
+
+/* ---------- 子面板：從 Excel 貼上匯入 ---------- */
+function importModal(){
+  var body = '<button class="x" data-act="close">✕</button><h3 class="mtitle">從 Excel 貼上匯入</h3>'
+    + '<p class="muted" style="margin-top:0">直接從 Excel 選取這幾欄複製，貼到下面：<b>日期、標的名稱、買/賣、單價、股數</b>（含稅金成本價可放第 6 或第 7 欄，非必要）。'
+    + '一行一筆，欄位之間用 Tab（直接從 Excel 複製貼上就是 Tab）或逗號分隔。標的名稱如果清單裡沒有，程式會自動新增。</p>'
+    + '<div class="field"><textarea id="f_importtext" rows="8" style="width:100%;padding:11px 12px;border-radius:10px;border:1px solid var(--line);font-family:ui-monospace,monospace;font-size:12.5px;" placeholder="2026-01-19\t穎崴\t買\t3420\t1000\t3424874"></textarea></div>'
+    + '<div id="import_preview"></div>'
+    + '<div class="acts"><button class="btn btn-g btn-blk" data-act="close">取消</button>'
+    + '<button class="btn btn-p btn-blk" data-act="parseimport">預覽</button></div>';
   openModal(body);
 }
 
@@ -817,7 +1026,7 @@ function toast(msg){
    事件處理
    ======================================================================= */
 document.addEventListener("click", function(e){
-  var t = e.target.closest("[data-tab],[data-act],[data-del],[data-type],[data-hmode]");
+  var t = e.target.closest("[data-tab],[data-act],[data-del],[data-type],[data-hmode],[data-delstock]");
   if(!t) return;
 
   if(t.dataset.tab){
@@ -832,6 +1041,24 @@ document.addEventListener("click", function(e){
     if(confirm("確定要刪除這筆紀錄嗎？")){
       STATE.txns = STATE.txns.filter(function(x){ return x.id!==t.dataset.del; });
       commit(); toast("已刪除");
+    }
+    return;
+  }
+  if(t.dataset.delstock){
+    var cnt = parseInt(t.dataset.count,10) || 0;
+    var nm = t.dataset.name;
+    if(cnt>0){
+      if(confirm('「'+nm+'」有 '+cnt+' 筆紀錄，刪除標的會一併刪除這些紀錄，且無法復原。確定要刪除嗎？')){
+        deleteStock(t.dataset.delstock, true);
+        toast("已刪除「"+nm+"」與其紀錄");
+        stockManageModal();
+      }
+    }else{
+      if(confirm('確定要刪除「'+nm+'」嗎？')){
+        deleteStock(t.dataset.delstock, false);
+        toast("已刪除「"+nm+"」");
+        stockManageModal();
+      }
     }
     return;
   }
@@ -908,6 +1135,70 @@ document.addEventListener("click", function(e){
       localStorage.removeItem(CODE_KEY);
       closeModal(); render();
     }
+  }
+  else if(act==="openfbsetup") firebaseSetupModal();
+  else if(act==="parsefb"){
+    var raw = document.getElementById("f_fbraw").value;
+    var res = parseFirebaseConfigText(raw);
+    var box = document.getElementById("fbparse_result");
+    if(res.missing.length>0){
+      box.innerHTML = '<div class="warn">貼上的內容裡找不到：<b>'+res.missing.join("、")+'</b>，請確認完整複製了 Firebase 的設定程式碼（包含所有欄位）。</div>';
+      return;
+    }
+    box.innerHTML = '<div class="warn" style="background:#E7F3ED;color:var(--loss)">✓ 解析成功，專案：'+esc(res.config.projectId)+'</div>';
+    saveFirebaseConfig(res.config);
+    toast("雲端設定已儲存");
+    setTimeout(function(){ closeModal(); settingsModal(); }, 500);
+  }
+  else if(act==="clearfbconfig"){
+    if(confirm("確定要清除目前的雲端設定嗎？這台裝置會回到本機模式，雲端上的資料不會被刪除。")){
+      clearFirebaseConfig();
+      closeModal(); toast("已清除雲端設定"); render();
+    }
+  }
+  else if(act==="openstockmanage") stockManageModal();
+  else if(act==="clearunused"){
+    var removed = clearUnusedStocks();
+    toast(removed>0 ? "已清除 "+removed+" 檔沒有紀錄的標的" : "沒有可清除的標的");
+    stockManageModal();
+  }
+  else if(act==="nukeall"){
+    var input = prompt('此動作會刪除「所有」交易紀錄，且無法復原（標的清單會保留）。\n請輸入「刪除」兩個字以確認：');
+    if(input==="刪除"){
+      clearAllRecords();
+      closeModal(); toast("已清除所有交易紀錄");
+    }else if(input!==null){
+      toast("輸入不符，已取消");
+    }
+  }
+  else if(act==="openimport") importModal();
+  else if(act==="parseimport"){
+    var txt = document.getElementById("f_importtext").value;
+    var parsed = parseImportText(txt);
+    var box = document.getElementById("import_preview");
+    if(parsed.rows.length===0){
+      box.innerHTML = '<div class="warn">沒有解析出任何可匯入的資料。'+(parsed.errors.length?'<br>'+parsed.errors.slice(0,6).join('<br>'):'')+'</div>';
+      return;
+    }
+    var summary = '<div class="warn" style="background:#E7F3ED;color:var(--loss)">'
+      + '✓ 可匯入 '+parsed.rows.length+' 筆交易'
+      + (parsed.newStockNames.length ? '，將新增 '+parsed.newStockNames.length+' 檔標的：'+esc(parsed.newStockNames.join('、')) : '')
+      + '</div>';
+    var errBox = parsed.errors.length
+      ? '<div class="warn">'+parsed.errors.length+' 行無法解析，已略過：<br>'+parsed.errors.slice(0,6).map(esc).join('<br>')+(parsed.errors.length>6?'<br>…':'')+'</div>'
+      : '';
+    box.innerHTML = summary + errBox
+      + '<button class="btn btn-p btn-blk" style="margin-top:10px" data-act="confirmimport">確認匯入 '+parsed.rows.length+' 筆</button>';
+    box.dataset.rows = JSON.stringify(parsed.rows);
+    box.dataset.newstocks = JSON.stringify(parsed.newStockNames);
+  }
+  else if(act==="confirmimport"){
+    var box = document.getElementById("import_preview");
+    var rows = JSON.parse(box.dataset.rows||"[]");
+    var newStocks = JSON.parse(box.dataset.newstocks||"[]");
+    commitImport(rows, newStocks);
+    closeModal();
+    toast("已匯入 "+rows.length+" 筆交易");
   }
 });
 
