@@ -128,6 +128,11 @@
   svg{display:block;width:100%;height:auto;}
 
   .srow{display:flex;align-items:center;justify-content:space-between;padding:14px 2px;border-bottom:1px solid var(--line);}
+  .help-h{font-weight:700;font-size:14.5px;margin:20px 0 6px;color:var(--ink);}
+  .help-h:first-child{margin-top:0;}
+  .help-p{font-size:13.5px;line-height:1.8;color:var(--ink-soft);margin:0 0 4px;}
+  .help-eg{background:var(--paper-deep);border-radius:10px;padding:10px 12px;font-size:12.5px;
+    color:var(--ink);line-height:1.7;margin:8px 0;}
   .srow:last-child{border-bottom:none;}
   .codebox{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;background:var(--paper-deep);
     padding:9px 11px;border-radius:8px;word-break:break-all;}
@@ -206,6 +211,10 @@ var STATE = {
   tab: "holdings",
   statsFilter: "all",   // "all" 或某個 stockId
   historyMode: "time",  // "time" 依時間 | "stock" 依標的
+  historyDateFilter: { type: "all" },   // all | month | range
+  historyRangeDraftOpen: false,
+  statsDateFilter: { type: "all" },
+  statsRangeDraftOpen: false,
   syncCode: "",
   syncStatus: "idle",   // idle | connecting | connected | error
   syncError: null
@@ -759,6 +768,53 @@ function viewHoldings(L){
   return '<div class="section">'+rows+'</div>';
 }
 
+/* ---------- 日期區間篩選 ---------- */
+function monthsFromTxns(){
+  var set={};
+  for(var i=0;i<STATE.txns.length;i++) set[STATE.txns[i].date.slice(0,7)]=true;
+  return Object.keys(set).sort().reverse();
+}
+function monthLabel(m){
+  var p=m.split("-");
+  return p[0]+"年"+p[1]+"月";
+}
+function inDateRange(dateStr, filter){
+  if(!filter || filter.type==="all") return true;
+  if(filter.type==="month") return dateStr.slice(0,7)===filter.month;
+  if(filter.type==="range") return dateStr>=filter.start && dateStr<=filter.end;
+  return true;
+}
+function dateFilterBarHTML(prefix, filter, draftOpen){
+  var months = monthsFromTxns();
+  var opts = '<option value="all"'+(filter.type==="all"?" selected":"")+'>全部區間</option>';
+  for(var i=0;i<months.length;i++){
+    var m=months[i];
+    var sel = (filter.type==="month" && filter.month===m) ? " selected" : "";
+    opts += '<option value="'+m+'"'+sel+'>'+monthLabel(m)+'</option>';
+  }
+  var customActive = filter.type==="range" || draftOpen;
+  opts += '<option value="custom"'+(customActive?" selected":"")+'>自訂區間…</option>';
+
+  var html = '<div class="field" style="margin-bottom:10px"><label>篩選區間</label>'
+    + '<select id="'+prefix+'RangeSelect" data-scope="'+prefix+'">'+opts+'</select></div>';
+
+  if(customActive){
+    var s = filter.type==="range" ? filter.start : "";
+    var e = filter.type==="range" ? filter.end : "";
+    html += '<div style="display:flex;gap:8px;align-items:flex-end;margin:-2px 0 10px">'
+      + '<div class="field" style="margin-bottom:0;flex:1"><label>起</label><input type="date" id="'+prefix+'RangeStart" value="'+s+'"></div>'
+      + '<div class="field" style="margin-bottom:0;flex:1"><label>迄</label><input type="date" id="'+prefix+'RangeEnd" value="'+e+'"></div>'
+      + '<button class="btn btn-g" style="padding:11px 14px" data-act="applyrange" data-scope="'+prefix+'">套用</button>'
+      + '</div>';
+  }
+  if(filter.type!=="all"){
+    var summary = filter.type==="month" ? monthLabel(filter.month) : filter.start+" ～ "+filter.end;
+    html += '<div class="muted" style="margin:-2px 0 12px">目前篩選：'+esc(summary)+' '
+      + '<span class="addlink" data-act="clearrange" data-scope="'+prefix+'">清除篩選</span></div>';
+  }
+  return html;
+}
+
 function txnRowHTML(t, stockName, showName){
   return '<div class="txn">'
     + '<div class="badge '+(t.type==="buy"?"b":"s")+'">'+(t.type==="buy"?"買":"賣")+'</div>'
@@ -777,15 +833,23 @@ function viewHistory(){
   var map={};
   for(var i=0;i<STATE.stocks.length;i++) map[STATE.stocks[i].id]=STATE.stocks[i];
 
+  var filterBar = dateFilterBarHTML("history", STATE.historyDateFilter, STATE.historyRangeDraftOpen);
+  var filteredTxns = STATE.txns.filter(function(t){ return inDateRange(t.date, STATE.historyDateFilter); });
+
   var toggle = '<div class="minitabs">'
     + '<div class="minitab '+(STATE.historyMode==="time"?"on":"")+'" data-hmode="time">依時間</div>'
     + '<div class="minitab '+(STATE.historyMode==="stock"?"on":"")+'" data-hmode="stock">依標的</div>'
     + '</div>';
 
+  if(filteredTxns.length===0){
+    return '<div class="section">'+filterBar
+      + '<div class="empty"><div class="g">📭</div><div>這段期間沒有交易紀錄</div></div></div>';
+  }
+
   var body="";
 
   if(STATE.historyMode==="time"){
-    var sorted = STATE.txns.slice().sort(function(a,b){
+    var sorted = filteredTxns.slice().sort(function(a,b){
       if(a.date!==b.date) return a.date<b.date?1:-1;
       return b.createdAt-a.createdAt;
     });
@@ -801,7 +865,7 @@ function viewHistory(){
     var groups=[];
     for(var k=0;k<STATE.stocks.length;k++){
       var st=STATE.stocks[k];
-      var list = STATE.txns.filter(function(x){ return x.stockId===st.id; })
+      var list = filteredTxns.filter(function(x){ return x.stockId===st.id; })
         .sort(function(a,b){
           if(a.date!==b.date) return a.date<b.date?1:-1;
           return b.createdAt-a.createdAt;
@@ -812,7 +876,7 @@ function viewHistory(){
     // 已刪除標的的孤兒交易
     var known={};
     for(var m=0;m<STATE.stocks.length;m++) known[STATE.stocks[m].id]=true;
-    var orphans = STATE.txns.filter(function(x){ return !known[x.stockId]; });
+    var orphans = filteredTxns.filter(function(x){ return !known[x.stockId]; });
     if(orphans.length>0){
       orphans.sort(function(a,b){ return a.date<b.date?1:-1; });
       groups.push({stock:{id:"__orphan", name:"（標的已刪除）", code:""}, list:orphans, latest:orphans[0].date, ledger:null});
@@ -828,7 +892,7 @@ function viewHistory(){
         var bits=[];
         if(lg.holdingShares>0.001) bits.push('持有 '+lots(lg.holdingShares));
         if(lg.realized.length>0){
-          bits.push('<span class="'+(lg.totalRealized>=0?"gain":"loss")+'" style="font-weight:700">已實現 '+money(lg.totalRealized)+'</span>');
+          bits.push('<span class="'+(lg.totalRealized>=0?"gain":"loss")+'" style="font-weight:700">已實現 '+money(lg.totalRealized)+'（全部區間）</span>');
         }
         if(bits.length===0) bits.push('—');
         meta = bits.join(' ・ ');
@@ -848,7 +912,7 @@ function viewHistory(){
     }
   }
 
-  return '<div class="section">'+toggle+body+'</div>';
+  return '<div class="section">'+filterBar+toggle+body+'</div>';
 }
 
 function viewStats(L){
@@ -861,7 +925,10 @@ function viewStats(L){
 
   var allRealized=[];
   for(var id in L){
-    for(var i=0;i<L[id].realized.length;i++) allRealized.push(L[id].realized[i]);
+    for(var i=0;i<L[id].realized.length;i++){
+      var r = L[id].realized[i];
+      allRealized.push({ stockId:id, sellDate:r.sellDate, buyDate:r.buyDate, shares:r.shares, buyUnit:r.buyUnit, sellUnit:r.sellUnit, profit:r.profit });
+    }
   }
 
   if(allRealized.length===0){
@@ -886,24 +953,37 @@ function viewStats(L){
   var picker = '<div class="field" style="margin-bottom:12px"><label>檢視範圍</label>'
     + '<select id="statsPick">'+opts+'</select></div>';
 
-  var out = '<div class="section">'+picker;
+  var filterBar = dateFilterBarHTML("stats", STATE.statsDateFilter, STATE.statsRangeDraftOpen);
+  var out = '<div class="section">'+picker+filterBar;
 
   if(STATE.statsFilter==="all"){
-    var sorted = allRealized.slice().sort(function(a,b){
+    var filteredAll = allRealized.filter(function(r){ return inDateRange(r.sellDate, STATE.statsDateFilter); });
+
+    if(filteredAll.length===0){
+      return out + '<div class="empty"><div class="g">📈</div><div>這段期間沒有已實現的交易</div></div></div>';
+    }
+
+    var sorted = filteredAll.slice().sort(function(a,b){
       return a.sellDate<b.sellDate?-1:a.sellDate>b.sellDate?1:0; });
     var cum=0, pts=[];
     for(var k=0;k<sorted.length;k++){
       cum += sorted[k].profit;
       pts.push({label:sorted[k].sellDate.slice(5), y:cum});
     }
+    var perStock={};
+    for(var f=0;f<filteredAll.length;f++){
+      var r2=filteredAll[f];
+      perStock[r2.stockId] = (perStock[r2.stockId]||0) + r2.profit;
+    }
     var items=[];
     for(var n=0;n<STATE.stocks.length;n++){
-      var st=STATE.stocks[n], l=L[st.id];
-      if(l && Math.abs(l.totalRealized)>0.001) items.push({name:st.name, value:l.totalRealized});
+      var st=STATE.stocks[n];
+      if(perStock[st.id] && Math.abs(perStock[st.id])>0.001) items.push({name:st.name, value:perStock[st.id]});
     }
     items.sort(function(a,b){ return b.value-a.value; });
 
-    out += '<div class="chartbox" id="chart_all_cum"><div class="ctitle-row"><div class="ctitle">已實現損益走勢（累積・全部標的）</div>'
+    var periodTitle = STATE.statsDateFilter.type==="all" ? "累積・全部標的" : "累積・全部標的（篩選區間）";
+    out += '<div class="chartbox" id="chart_all_cum"><div class="ctitle-row"><div class="ctitle">已實現損益走勢（'+periodTitle+'）</div>'
       + '<span class="dlbtn" data-dlchart="chart_all_cum" data-dlname="累積損益走勢_全部">下載 PNG</span></div>'+lineChartSVG(pts)+'</div>'
       + '<div class="chartbox" id="chart_all_bar"><div class="ctitle-row"><div class="ctitle">各標的已實現損益</div>'
       + '<span class="dlbtn" data-dlchart="chart_all_bar" data-dlname="各標的已實現損益">下載 PNG</span></div>'+barChartSVG(items)+'</div>';
@@ -912,33 +992,41 @@ function viewStats(L){
     var stock=null;
     for(var p=0;p<STATE.stocks.length;p++) if(STATE.stocks[p].id===STATE.statsFilter) stock=STATE.stocks[p];
 
-    var trades = lg.realized.slice().sort(function(a,b){
+    var allTrades = lg.realized.slice().sort(function(a,b){
       return a.sellDate<b.sellDate?-1:a.sellDate>b.sellDate?1:0; });
+    var trades = allTrades.filter(function(r){ return inDateRange(r.sellDate, STATE.statsDateFilter); });
 
-    var c=0, tpts=[];
-    for(var q=0;q<trades.length;q++){
-      c += trades[q].profit;
-      tpts.push({label:trades[q].sellDate.slice(5), y:c});
+    var periodTotal=0, wins=0, losses=0;
+    for(var r=0;r<trades.length;r++){
+      periodTotal += trades[r].profit;
+      if(trades[r].profit>=0) wins++; else losses++;
     }
-
-    var wins=0, losses=0;
-    for(var r=0;r<trades.length;r++){ if(trades[r].profit>=0) wins++; else losses++; }
 
     out += '<div class="card">'
       + '<div class="rb"><div><span class="sname">'+esc(stock?stock.name:"")+'</span>'
       + '<span class="scode">'+esc(stock?stock.code:"")+'</span></div>'
-      + '<span class="num '+(lg.totalRealized>=0?"gain":"loss")+'" style="font-weight:700;font-size:17px">'
-      + money(lg.totalRealized)+'</span></div>'
+      + '<span class="num '+(periodTotal>=0?"gain":"loss")+'" style="font-weight:700;font-size:17px">'
+      + money(periodTotal)+'</span></div>'
       + '<div class="muted" style="margin-top:8px">'
       + trades.length+' 次進出 ・ 賺 '+wins+' 次 ・ 賠 '+losses+' 次'
       + (lg.holdingShares>0.001 ? ' ・ 目前持有 '+lots(lg.holdingShares) : '')
+      + (STATE.statsDateFilter.type!=="all" ? ' ・ <span class="muted">（此為篩選區間內數字，非全部區間）</span>' : '')
       + '</div></div>';
 
-    var stockNameSafe = (stock?stock.name:"標的").replace(/[\\/:*?"<>|]/g,"");
-    out += '<div class="chartbox" id="chart_one_cum"><div class="ctitle-row"><div class="ctitle">累積已實現損益</div>'
-      + '<span class="dlbtn" data-dlchart="chart_one_cum" data-dlname="'+esc(stockNameSafe)+'_累積損益">下載 PNG</span></div>'+lineChartSVG(tpts)+'</div>'
-      + '<div class="chartbox" id="chart_one_bar"><div class="ctitle-row"><div class="ctitle">每筆進出損益</div>'
-      + '<span class="dlbtn" data-dlchart="chart_one_bar" data-dlname="'+esc(stockNameSafe)+'_每筆損益">下載 PNG</span></div>'+tradeBarSVG(trades)+'</div>';
+    if(trades.length===0){
+      out += '<div class="empty"><div class="g">📈</div><div>這段期間這支標的沒有已實現的交易</div></div>';
+    }else{
+      var c=0, tpts=[];
+      for(var q=0;q<trades.length;q++){
+        c += trades[q].profit;
+        tpts.push({label:trades[q].sellDate.slice(5), y:c});
+      }
+      var stockNameSafe = (stock?stock.name:"標的").replace(/[\\/:*?"<>|]/g,"");
+      out += '<div class="chartbox" id="chart_one_cum"><div class="ctitle-row"><div class="ctitle">累積已實現損益</div>'
+        + '<span class="dlbtn" data-dlchart="chart_one_cum" data-dlname="'+esc(stockNameSafe)+'_累積損益">下載 PNG</span></div>'+lineChartSVG(tpts)+'</div>'
+        + '<div class="chartbox" id="chart_one_bar"><div class="ctitle-row"><div class="ctitle">每筆進出損益</div>'
+        + '<span class="dlbtn" data-dlchart="chart_one_bar" data-dlname="'+esc(stockNameSafe)+'_每筆損益">下載 PNG</span></div>'+tradeBarSVG(trades)+'</div>';
+    }
   }
 
   return out + '</div>';
@@ -1034,7 +1122,9 @@ function settingsModal(){
   body += '<div class="srow" style="margin-top:18px"><span class="muted">交易筆數</span><span>'+STATE.txns.length+' 筆</span></div>'
     + '<div class="srow"><span class="muted">標的數</span><span>'+STATE.stocks.length+' 檔</span></div>';
 
-  body += '<div style="margin-top:16px;display:flex;flex-direction:column;gap:8px">'
+  body += '<button class="btn btn-p btn-blk" style="margin-top:16px" data-act="opentutorial">📖 使用說明</button>';
+
+  body += '<div style="margin-top:12px;display:flex;flex-direction:column;gap:8px">'
     + '<button class="btn btn-g btn-blk" data-act="openimport">從 Excel 貼上匯入交易</button>'
     + '<button class="btn btn-g btn-blk" data-act="openstockmanage">管理標的清單</button>'
     + '<button class="btn btn-g btn-blk" data-act="export">匯出備份檔</button>'
@@ -1108,6 +1198,51 @@ function showSyncConflictModal(localCount, cloudCount){
     + '<button class="btn btn-p btn-blk" style="margin-top:16px" data-act="conflict_usecloud">使用雲端資料（覆蓋本機）</button>'
     + '<button class="btn btn-g btn-blk" style="margin-top:10px" data-act="conflict_uselocal">使用本機資料（覆蓋雲端）</button>'
     + '<button class="btn btn-g btn-blk" style="margin-top:10px" data-act="conflict_cancel">取消，不同步這組代碼</button>';
+  openModal(body);
+}
+
+/* ---------- 子面板：使用說明 ---------- */
+function tutorialModal(){
+  var S = 'style="font-size:13.5px;line-height:1.75;color:var(--ink)"';
+  var H = 'style="font-weight:700;font-size:15px;margin:18px 0 8px"';
+  var body = '<button class="x" data-act="close">✕</button><h3 class="mtitle">使用說明</h3>'
+
+    + '<div '+H+'>這個程式在做什麼</div>'
+    + '<p '+S+'>就是把原本用 Excel 記錄「買了什麼、賣了什麼」的習慣搬到這裡，但多一件事：'
+    + '每次賣出，程式會自動幫你算「這筆賺了還是賠了多少」，不用自己心算或另外對表。</p>'
+
+    + '<div '+H+'>怎麼記一筆交易</div>'
+    + '<p '+S+'>按右下角的「＋」按鈕。要填的東西：</p>'
+    + '<p '+S+'>• <b>買進 / 賣出</b>：先選這筆是買還是賣<br>'
+    + '• <b>標的</b>：選股票名稱，清單裡沒有的話按旁邊「＋新增標的」<br>'
+    + '• <b>日期</b>：成交那天<br>'
+    + '• <b>張數</b>：1 張 = 1000 股，跟證券公司對帳單上寫的一樣<br>'
+    + '• <b>成交單價</b>：買進或賣出那個價格<br>'
+    + '• <b>含稅金成本價</b>：扣掉（或加上）手續費、證交稅之後，實際入帳或扣款的金額。這欄留空的話，程式會用「單價 × 股數」自動算一個大概的數字，但跟證券公司對帳單上的實際金額會有一點誤差（差在手續費、稅金）</p>'
+
+    + '<div '+H+'>已實現損益是怎麼算出來的</div>'
+    + '<p '+S+'>用一個例子說明：假設你買了兩批同一支股票，第一批 1000 股、每股 100 元，第二批 1000 股、每股 200 元。'
+    + '後來你賣掉 1500 股、每股 300 元。程式會照「先買的先賣」的順序去配對：先用第一批的 1000 股去配（賺了 (300-100)×1000 = 200,000），'
+    + '剩下的 500 股用第二批去配（賺了 (300-200)×500 = 50,000），加起來這次總共賺 250,000。'
+    + '你完全不用自己算這些，程式會自動配對，「歷史紀錄」跟「統計圖表」看到的損益數字都是這樣算出來的。</p>'
+
+    + '<div '+H+'>三個頁籤分別在看什麼</div>'
+    + '<p '+S+'>• <b>持有中</b>：現在手上還沒賣掉的股票，有多少張、平均成本多少<br>'
+    + '• <b>歷史紀錄</b>：每一筆買賣的紀錄，可以切換「依時間」（照日期排）或「依標的」（同一支股票收在一起看）<br>'
+    + '• <b>統計圖表</b>：損益的走勢圖，可以選「全部標的」或單一一支股票來看，也可以只看某個月份或某段期間</p>'
+
+    + '<div '+H+'>畫面上的顏色代表什麼</div>'
+    + '<p '+S+'>紅色代表賺、綠色代表賠，跟台股看盤軟體的習慣一樣。</p>'
+
+    + '<div '+H+'>如果賣出時看到警示</div>'
+    + '<p '+S+'>如果畫面提醒「賣出數量超過可配對的買進」，通常代表這支股票有一筆買進忘了先記錄，回「歷史紀錄」檢查一下有沒有漏記。</p>'
+
+    + '<div '+H+'>資料存在哪裡、安全嗎</div>'
+    + '<p '+S+'>資料存在這台裝置的瀏覽器裡，不用網路也能用。如果有另外設定「雲端同步」，資料還會存一份在雲端，這樣手機和電腦才能看到同一份紀錄。設定裡也可以「匯出備份檔」，多存一份在電腦裡最保險。</p>'
+
+    + '<div '+H+'>忘記怎麼用了怎麼辦</div>'
+    + '<p '+S+'>設定裡隨時可以按「📖 使用說明」回來看這一頁。</p>';
+
   openModal(body);
 }
 
@@ -1242,6 +1377,24 @@ document.addEventListener("click", function(e){
     localStorage.removeItem(CODE_KEY);
     closeModal(); render(); toast("已取消，資料未變動");
   }
+  else if(act==="applyrange"){
+    var scope2 = t.dataset.scope;
+    var sEl = document.getElementById(scope2+"RangeStart");
+    var eEl = document.getElementById(scope2+"RangeEnd");
+    var sVal = sEl ? sEl.value : "";
+    var eVal = eEl ? eEl.value : "";
+    if(!sVal || !eVal){ alert("請選擇起訖日期"); return; }
+    if(sVal>eVal){ alert("「起」的日期不能晚於「迄」的日期"); return; }
+    STATE[scope2+"DateFilter"] = { type:"range", start:sVal, end:eVal };
+    STATE[scope2+"RangeDraftOpen"] = false;
+    render();
+  }
+  else if(act==="clearrange"){
+    var scope3 = t.dataset.scope;
+    STATE[scope3+"DateFilter"] = { type:"all" };
+    STATE[scope3+"RangeDraftOpen"] = false;
+    render();
+  }
   else if(act==="export")    exportBackup();
   else if(act==="triggerrestore"){
     var inp = document.getElementById("backupFileInput");
@@ -1342,6 +1495,7 @@ document.addEventListener("click", function(e){
       toast("輸入不符，已取消");
     }
   }
+  else if(act==="opentutorial") tutorialModal();
   else if(act==="openimport") importModal();
   else if(act==="parseimport"){
     var txt = document.getElementById("f_importtext").value;
@@ -1376,6 +1530,22 @@ document.addEventListener("click", function(e){
 document.addEventListener("change", function(e){
   if(e.target && e.target.id==="statsPick"){
     STATE.statsFilter = e.target.value;
+    render();
+  }
+  if(e.target && (e.target.id==="historyRangeSelect" || e.target.id==="statsRangeSelect")){
+    var scope = e.target.dataset.scope; // "hist" | "stats"
+    var val = e.target.value;
+    var filterKey = scope+"DateFilter";
+    var draftKey = scope+"RangeDraftOpen";
+    if(val==="all"){
+      STATE[filterKey] = { type:"all" };
+      STATE[draftKey] = false;
+    }else if(val==="custom"){
+      STATE[draftKey] = true;
+    }else{
+      STATE[filterKey] = { type:"month", month: val };
+      STATE[draftKey] = false;
+    }
     render();
   }
   if(e.target && e.target.id==="backupFileInput"){
