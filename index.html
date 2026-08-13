@@ -77,6 +77,10 @@
   .badge.b{background:#FBEAE8;color:var(--gain);}
   .badge.s{background:#E7F3ED;color:var(--loss);}
   .del{cursor:pointer;font-size:12px;color:var(--ink-soft);text-decoration:underline;}
+  .edit{cursor:pointer;font-size:12px;color:var(--gold);text-decoration:underline;font-weight:600;}
+  .rowacts{display:flex;gap:10px;justify-content:flex-end;margin-top:2px;}
+  .tnote{font-size:12px;color:var(--ink-soft);margin-top:3px;padding-left:8px;
+    border-left:2px solid var(--line);font-style:italic;}
 
   .empty{text-align:center;padding:52px 20px;color:var(--ink-soft);}
   .empty .g{font-size:34px;margin-bottom:10px;}
@@ -122,6 +126,12 @@
   .chartbox{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
     box-shadow:var(--shadow);padding:16px;margin-bottom:12px;}
   .ctitle-row{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px;}
+  .sumtable{width:100%;border-collapse:collapse;font-size:13px;font-variant-numeric:tabular-nums;}
+  .sumtable th{font-size:11.5px;color:var(--ink-soft);font-weight:600;padding:6px 4px;
+    border-bottom:1px solid var(--line);text-align:center;}
+  .sumtable td{padding:7px 4px;text-align:center;border-bottom:1px dashed var(--line);}
+  .sumtable tr:last-child td{border-bottom:none;}
+  .sumtable tr.yearrow td{background:var(--paper-deep);border-bottom:1px solid var(--line);}
   .dlbtn{font-size:11.5px;color:var(--gold);font-weight:700;cursor:pointer;text-decoration:underline;
     white-space:nowrap;flex:none;}
   .ctitle{font-size:13px;font-weight:700;color:var(--ink-soft);margin-bottom:12px;}
@@ -203,6 +213,25 @@ function esc(s){ return String(s==null?"":s).replace(/[&<>"']/g,function(c){
 function money(n){ var v=Math.round(n); return (v<0?"-":"")+"$"+Math.abs(v).toLocaleString("zh-TW"); }
 function lots(sh){ var l=sh/1000; return (Number.isInteger(l)?l:l.toFixed(2))+" 張"; }
 function today(){ var d=new Date(); return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0"); }
+function pct(n){ return (n>=0?"+":"")+n.toFixed(2)+"%"; }
+
+/* ---------- 交易欄位共用驗證 ---------- */
+function validateTxnFields(f){
+  // f: {stockId, date, lots, price, cost}
+  if(!f.stockId) return "請選擇標的";
+  if(!f.date) return "請選擇成交日期";
+  if(f.date > today()) return "成交日期不能是未來的日期，請確認年份有沒有打錯";
+  var lots = parseFloat(f.lots);
+  if(!lots || lots<=0 || !isFinite(lots)) return "請填寫正確的張數（要大於 0）";
+  var price = parseFloat(f.price);
+  if(!price || price<=0 || !isFinite(price)) return "請填寫正確的成交單價（要大於 0）";
+  if(f.cost!==""){
+    var c = parseFloat(f.cost);
+    if(isNaN(c) || !isFinite(c)) return "含稅金成本價不是有效的數字";
+    if(c<=0) return "含稅金成本價要大於 0，請確認有沒有多打減號";
+  }
+  return null;
+}
 
 /* ---------- 資料狀態 ---------- */
 var STATE = {
@@ -215,6 +244,7 @@ var STATE = {
   historyRangeDraftOpen: false,
   statsDateFilter: { type: "all" },
   statsRangeDraftOpen: false,
+  costMethod: "fifo",   // fifo 先進先出 | avg 平均成本
   syncCode: "",
   syncStatus: "idle",   // idle | connecting | connected | error
   syncError: null
@@ -222,6 +252,7 @@ var STATE = {
 
 var LOCAL_KEY = "dadstock_data_v2";
 var CODE_KEY  = "dadstock_sync_code";
+var METHOD_KEY = "dadstock_cost_method";
 
 function loadLocal(){
   try{
@@ -232,6 +263,8 @@ function loadLocal(){
       if(d.txns) STATE.txns = d.txns;
     }
     STATE.syncCode = localStorage.getItem(CODE_KEY) || "";
+    var cm = localStorage.getItem(METHOD_KEY);
+    if(cm==="fifo" || cm==="avg") STATE.costMethod = cm;
   }catch(e){ console.warn("本機資料讀取失敗", e); }
 }
 function saveLocal(){
@@ -248,39 +281,93 @@ function ledgerFor(stockId){
       return a.createdAt-b.createdAt;
     });
 
-  var queue=[], realized=[], warnings=[];
+  var method = STATE.costMethod || "fifo";
+  var realized=[], warnings=[];
+  var queue=[];            // fifo 用：每批買進
+  var avgShares=0, avgCost=0;  // 平均成本用：目前總股數 / 總成本
+
   for(var i=0;i<list.length;i++){
     var t=list[i];
     var unit = t.costWithTax / t.shares;
+
     if(t.type==="buy"){
-      queue.push({left:t.shares, unit:unit, date:t.date});
-    }else{
-      var remain=t.shares, avail=0;
-      for(var q=0;q<queue.length;q++) avail+=queue[q].left;
-      if(avail < remain-0.0001){
-        warnings.push(t.date+" 賣出 "+lots(t.shares)+"，但可配對的買進不足，請檢查是否漏記買進。");
+      if(method==="fifo"){
+        queue.push({left:t.shares, unit:unit, date:t.date});
+      }else{
+        avgShares += t.shares;
+        avgCost += t.costWithTax;
       }
-      while(remain>0.0001 && queue.length>0){
-        var lot=queue[0];
-        var m=Math.min(remain, lot.left);
-        realized.push({
-          sellDate:t.date, buyDate:lot.date, shares:m,
-          buyUnit:lot.unit, sellUnit:unit, profit:m*(unit-lot.unit)
-        });
-        lot.left-=m; remain-=m;
-        if(lot.left<=0.0001) queue.shift();
+    }else{
+      if(method==="fifo"){
+        var remain=t.shares, avail=0;
+        for(var q=0;q<queue.length;q++) avail+=queue[q].left;
+        if(avail < remain-0.0001){
+          warnings.push(t.date+" 賣出 "+lots(t.shares)+"，但可配對的買進不足，請檢查是否漏記買進。");
+        }
+        while(remain>0.0001 && queue.length>0){
+          var lot=queue[0];
+          var m=Math.min(remain, lot.left);
+          var costBasis = m*lot.unit;
+          realized.push({
+            sellDate:t.date, buyDate:lot.date, shares:m,
+            buyUnit:lot.unit, sellUnit:unit, profit:m*(unit-lot.unit),
+            cost: costBasis,
+            roi: costBasis>0 ? (m*(unit-lot.unit))/costBasis*100 : 0
+          });
+          lot.left-=m; remain-=m;
+          if(lot.left<=0.0001) queue.shift();
+        }
+      }else{
+        if(avgShares < t.shares-0.0001){
+          warnings.push(t.date+" 賣出 "+lots(t.shares)+"，但可配對的買進不足，請檢查是否漏記買進。");
+        }
+        var sellQty = Math.min(t.shares, avgShares);
+        if(sellQty > 0.0001){
+          var unitAvg = avgCost/avgShares;
+          var cb = sellQty*unitAvg;
+          var proceeds = sellQty*unit;
+          realized.push({
+            sellDate:t.date, buyDate:null, shares:sellQty,
+            buyUnit:unitAvg, sellUnit:unit, profit:proceeds-cb,
+            cost: cb,
+            roi: cb>0 ? (proceeds-cb)/cb*100 : 0
+          });
+          avgCost -= cb;
+          avgShares -= sellQty;
+          if(avgShares<=0.0001){ avgShares=0; avgCost=0; }
+        }
       }
     }
   }
+
   var hs=0, hc=0;
-  for(var k=0;k<queue.length;k++){ hs+=queue[k].left; hc+=queue[k].left*queue[k].unit; }
-  var total=0;
-  for(var r=0;r<realized.length;r++) total+=realized[r].profit;
-  return { holdingShares:hs, avgCost: hs>0?hc/hs:0, realized:realized, totalRealized:total, warnings:warnings };
+  if(method==="fifo"){
+    for(var k=0;k<queue.length;k++){ hs+=queue[k].left; hc+=queue[k].left*queue[k].unit; }
+  }else{
+    hs=avgShares; hc=avgCost;
+  }
+
+  var total=0, totalCost=0;
+  for(var r=0;r<realized.length;r++){ total+=realized[r].profit; totalCost+=realized[r].cost; }
+  return {
+    holdingShares:hs, avgCost: hs>0?hc/hs:0, holdingCost:hc,
+    realized:realized, totalRealized:total,
+    realizedCost: totalCost,
+    totalRoi: totalCost>0 ? total/totalCost*100 : 0,
+    warnings:warnings
+  };
 }
 function allLedgers(){
-  var m={};
-  for(var i=0;i<STATE.stocks.length;i++) m[STATE.stocks[i].id]=ledgerFor(STATE.stocks[i].id);
+  var m={}, seen={};
+  for(var i=0;i<STATE.stocks.length;i++){
+    seen[STATE.stocks[i].id]=true;
+    m[STATE.stocks[i].id]=ledgerFor(STATE.stocks[i].id);
+  }
+  // 涵蓋「標的已被刪除但交易還在」的孤兒資料，避免首頁總計漏算
+  for(var j=0;j<STATE.txns.length;j++){
+    var sid=STATE.txns[j].stockId;
+    if(!seen[sid]){ seen[sid]=true; m[sid]=ledgerFor(sid); }
+  }
   return m;
 }
 
@@ -470,11 +557,26 @@ function splitCols(line){
   return line.split(",").map(function(x){return x.trim();});
 }
 
+function txnSignature(r){
+  // 用「日期+標的名+買賣+股數+單價+含稅成本」判斷是否為同一筆
+  return [r.date, r.name, r.type, Math.round(r.shares), Number(r.price).toFixed(4), Math.round(r.costWithTax)].join("|");
+}
+
 function parseImportText(text){
   var lines = text.split(/\r?\n/).map(function(l){return l.trim();}).filter(function(l){return l.length>0;});
-  var rows=[], errors=[], newStockNames=[];
+  var rows=[], errors=[], newStockNames=[], dupExisting=[], dupInFile=[];
   var existingByName = {};
   STATE.stocks.forEach(function(s){ existingByName[s.name]=s; });
+
+  // 建立目前已有交易的簽章索引，用來偵測重複匯入
+  var stockNameById = {};
+  STATE.stocks.forEach(function(s){ stockNameById[s.id]=s.name; });
+  var existingSigs = {}, seenInFile = {};
+  STATE.txns.forEach(function(t){
+    var nm = stockNameById[t.stockId];
+    if(!nm) return;
+    existingSigs[txnSignature({date:t.date, name:nm, type:t.type, shares:t.shares, price:t.price, costWithTax:t.costWithTax})] = true;
+  });
 
   for(var i=0;i<lines.length;i++){
     var cols = splitCols(lines[i]);
@@ -490,18 +592,30 @@ function parseImportText(text){
     var costWithTax = cols.length>=7 ? parseFloat(cols[6]) : (cols.length===6 ? parseFloat(cols[5]) : NaN);
 
     if(!date){ errors.push("第 "+(i+1)+" 行：日期格式看不懂「"+cols[0]+"」，已略過"); continue; }
+    if(date > today()){ errors.push("第 "+(i+1)+" 行：日期「"+date+"」是未來的日期，請確認年份，已略過"); continue; }
     if(!name){ errors.push("第 "+(i+1)+" 行：標的名稱是空的，已略過"); continue; }
     if(!type){ errors.push("第 "+(i+1)+" 行：買賣別看不出來「"+cols[2]+"」，已略過"); continue; }
     if(!price || price<=0){ errors.push("第 "+(i+1)+" 行：價格不是有效數字，已略過"); continue; }
     if(!shares || shares<=0){ errors.push("第 "+(i+1)+" 行：股數不是有效數字，已略過"); continue; }
     if(isNaN(costWithTax) || costWithTax<=0){ costWithTax = price*shares; }
 
+    var sig = txnSignature({date:date, name:name, type:type, price:price, shares:shares, costWithTax:costWithTax});
+    if(existingSigs[sig]){
+      dupExisting.push("第 "+(i+1)+" 行："+date+" "+name+" "+(type==="buy"?"買":"賣"));
+      continue;
+    }
+    if(seenInFile[sig]){
+      dupInFile.push("第 "+(i+1)+" 行："+date+" "+name+" "+(type==="buy"?"買":"賣"));
+      continue;
+    }
+    seenInFile[sig]=true;
+
     if(!existingByName[name] && newStockNames.indexOf(name)===-1){
       newStockNames.push(name);
     }
     rows.push({date:date, name:name, type:type, price:price, shares:shares, costWithTax:costWithTax});
   }
-  return { rows:rows, errors:errors, newStockNames:newStockNames };
+  return { rows:rows, errors:errors, newStockNames:newStockNames, dupExisting:dupExisting, dupInFile:dupInFile };
 }
 
 function commitImport(rows, newStockNames){
@@ -592,6 +706,59 @@ function barChartSVG(items){
     out += '<text x="'+(PL+w+8).toFixed(1)+'" y="'+(y+rowH/2+4)+'" font-size="12" fill="'+color+'" font-weight="700">'+money(it.value)+'</text>';
   }
   out += '</svg>';
+  return out;
+}
+
+/* ---------- 年度 / 月度損益總結表 ---------- */
+function periodSummaryHTML(realizedList){
+  if(realizedList.length===0) return "";
+
+  var byYear = {};
+  for(var i=0;i<realizedList.length;i++){
+    var r = realizedList[i];
+    var y = r.sellDate.slice(0,4);
+    var m = r.sellDate.slice(0,7);
+    if(!byYear[y]) byYear[y] = { profit:0, cost:0, count:0, months:{} };
+    byYear[y].profit += r.profit;
+    byYear[y].cost += r.cost;
+    byYear[y].count++;
+    if(!byYear[y].months[m]) byYear[y].months[m] = { profit:0, cost:0, count:0 };
+    byYear[y].months[m].profit += r.profit;
+    byYear[y].months[m].cost += r.cost;
+    byYear[y].months[m].count++;
+  }
+
+  var years = Object.keys(byYear).sort().reverse();
+  var out = '<div class="chartbox"><div class="ctitle">年度・月度損益總結</div>'
+    + '<table class="sumtable"><thead><tr>'
+    + '<th style="text-align:left">期間</th><th>筆數</th><th style="text-align:right">損益</th><th style="text-align:right">報酬率</th>'
+    + '</tr></thead><tbody>';
+
+  for(var yi=0; yi<years.length; yi++){
+    var y = years[yi], yd = byYear[y];
+    var yRoi = yd.cost>0 ? yd.profit/yd.cost*100 : 0;
+    out += '<tr class="yearrow">'
+      + '<td style="text-align:left"><b>'+y+' 年</b></td>'
+      + '<td>'+yd.count+'</td>'
+      + '<td style="text-align:right" class="'+(yd.profit>=0?"gain":"loss")+'"><b>'+money(yd.profit)+'</b></td>'
+      + '<td style="text-align:right" class="'+(yd.profit>=0?"gain":"loss")+'"><b>'+pct(yRoi)+'</b></td>'
+      + '</tr>';
+
+    var months = Object.keys(yd.months).sort().reverse();
+    for(var mi=0; mi<months.length; mi++){
+      var m = months[mi], md = yd.months[m];
+      var mRoi = md.cost>0 ? md.profit/md.cost*100 : 0;
+      out += '<tr>'
+        + '<td style="text-align:left;padding-left:16px" class="muted">'+m.slice(5)+' 月</td>'
+        + '<td class="muted">'+md.count+'</td>'
+        + '<td style="text-align:right" class="'+(md.profit>=0?"gain":"loss")+'">'+money(md.profit)+'</td>'
+        + '<td style="text-align:right" class="'+(md.profit>=0?"gain":"loss")+'">'+pct(mRoi)+'</td>'
+        + '</tr>';
+    }
+  }
+  out += '</tbody></table>'
+    + '<div class="muted" style="margin-top:10px;font-size:11.5px">損益歸屬到「賣出」那個月份。報酬率 = 該期間損益 ÷ 該期間賣掉部位的投入成本。</div>'
+    + '</div>';
   return out;
 }
 
@@ -686,12 +853,15 @@ function downloadChartPNG(containerId, filename){
    ======================================================================= */
 function render(){
   var L = allLedgers();
-  var totalRealized=0, realizedCount=0, warns=[];
+  var totalRealized=0, realizedCount=0, realizedCost=0, holdingCostTotal=0, warns=[];
   for(var id in L){
     totalRealized += L[id].totalRealized;
     realizedCount += L[id].realized.length;
+    realizedCost += L[id].realizedCost;
+    holdingCostTotal += L[id].holdingCost;
     warns = warns.concat(L[id].warnings);
   }
+  var totalRoi = realizedCost>0 ? totalRealized/realizedCost*100 : 0;
 
   var html = "";
 
@@ -721,9 +891,18 @@ function render(){
   /* 總計卡 */
   html += '<div class="stamp"><div>'
     + '<div class="label">累積已實現損益</div>'
-    + '<div class="value num '+(totalRealized>=0?"gain":"loss")+'">'+money(totalRealized)+'</div>'
-    + '<div class="foot">共 '+realizedCount+' 筆已出場交易</div>'
+    + '<div class="value num '+(totalRealized>=0?"gain":"loss")+'">'+money(totalRealized)
+    + (realizedCost>0 ? ' <span style="font-size:15px">'+pct(totalRoi)+'</span>' : '')+'</div>'
+    + '<div class="foot">共 '+realizedCount+' 筆已出場交易'
+    + (realizedCost>0 ? '　投入成本 '+money(realizedCost) : '')+'</div>'
     + '</div><div class="chop '+(totalRealized>=0?"":"neg")+'">'+(totalRealized>=0?"獲利<br>已實現":"虧損<br>已實現")+'</div></div>';
+
+  if(holdingCostTotal>0){
+    html += '<div class="stamp" style="padding:16px 20px">'
+      + '<div><div class="label">目前持有中的投入成本</div>'
+      + '<div style="font-size:21px;font-weight:700" class="num">'+money(holdingCostTotal)+'</div>'
+      + '<div class="foot">尚未賣出，這部分損益還沒實現</div></div></div>';
+  }
 
   if(warns.length>0){
     html += '<div class="warn">⚠ 有 '+warns.length+' 筆資料配對異常，請到「歷史紀錄」確認是否漏記買進。</div>';
@@ -749,15 +928,25 @@ function render(){
 }
 
 function viewHoldings(L){
-  var rows="";
+  var held=[];
   for(var i=0;i<STATE.stocks.length;i++){
     var s=STATE.stocks[i], l=L[s.id];
     if(!l || l.holdingShares<=0.001) continue;
+    held.push({stock:s, ledger:l});
+  }
+  // 依投入金額由大到小排，重壓的部位排前面
+  held.sort(function(a,b){ return b.ledger.holdingCost - a.ledger.holdingCost; });
+
+  var rows="";
+  for(var j=0;j<held.length;j++){
+    var s2=held[j].stock, l2=held[j].ledger;
     rows += '<div class="card">'
-      + '<div class="rb"><div><span class="sname">'+esc(s.name)+'</span><span class="scode">'+esc(s.code)+'</span></div>'
-      + '<span class="pill">'+lots(l.holdingShares)+'</span></div>'
+      + '<div class="rb"><div><span class="sname">'+esc(s2.name)+'</span><span class="scode">'+esc(s2.code)+'</span></div>'
+      + '<span class="pill">'+lots(l2.holdingShares)+'</span></div>'
       + '<div class="rb" style="margin-top:10px"><span class="muted">平均成本（含稅金）</span>'
-      + '<span class="num" style="font-weight:700">'+money(l.avgCost)+' / 股</span></div>'
+      + '<span class="num" style="font-weight:700">'+money(l2.avgCost)+' / 股</span></div>'
+      + '<div class="rb" style="margin-top:6px"><span class="muted">投入成本小計</span>'
+      + '<span class="num" style="font-weight:700">'+money(l2.holdingCost)+'</span></div>'
       + '</div>';
   }
   if(!rows){
@@ -820,9 +1009,12 @@ function txnRowHTML(t, stockName, showName){
     + '<div class="badge '+(t.type==="buy"?"b":"s")+'">'+(t.type==="buy"?"買":"賣")+'</div>'
     + '<div>'
     + (showName ? '<div style="font-weight:700;font-size:14px">'+esc(stockName)+'</div>' : '')
-    + '<div class="muted">'+esc(t.date)+' ・ '+lots(t.shares)+' ・ 單價 '+t.price+'</div></div>'
+    + '<div class="muted">'+esc(t.date)+' ・ '+lots(t.shares)+' ・ 單價 '+t.price+'</div>'
+    + (t.note ? '<div class="tnote">'+esc(t.note)+'</div>' : '')
+    + '</div>'
     + '<div style="text-align:right"><div class="num" style="font-weight:700">'+money(t.costWithTax)+'</div>'
-    + '<div class="del" data-del="'+t.id+'">刪除</div></div>'
+    + '<div class="rowacts"><span class="edit" data-edit="'+t.id+'">編輯</span>'
+    + '<span class="del" data-del="'+t.id+'">刪除</span></div></div>'
     + '</div>';
 }
 
@@ -892,7 +1084,8 @@ function viewHistory(){
         var bits=[];
         if(lg.holdingShares>0.001) bits.push('持有 '+lots(lg.holdingShares));
         if(lg.realized.length>0){
-          bits.push('<span class="'+(lg.totalRealized>=0?"gain":"loss")+'" style="font-weight:700">已實現 '+money(lg.totalRealized)+'（全部區間）</span>');
+          bits.push('<span class="'+(lg.totalRealized>=0?"gain":"loss")+'" style="font-weight:700">已實現 '
+            + money(lg.totalRealized)+' '+pct(lg.totalRoi)+'（全部區間）</span>');
         }
         if(bits.length===0) bits.push('—');
         meta = bits.join(' ・ ');
@@ -954,7 +1147,10 @@ function viewStats(L){
     + '<select id="statsPick">'+opts+'</select></div>';
 
   var filterBar = dateFilterBarHTML("stats", STATE.statsDateFilter, STATE.statsRangeDraftOpen);
-  var out = '<div class="section">'+picker+filterBar;
+  var methodTag = '<div class="muted" style="margin:-4px 0 12px;font-size:11.5px">'
+    + '成本算法：<b>'+((STATE.costMethod||"fifo")==="fifo"?"先進先出":"平均成本")+'</b>'
+    + '　<span class="addlink" data-act="opensettings" style="font-size:11.5px">切換</span></div>';
+  var out = '<div class="section">'+picker+filterBar+methodTag;
 
   if(STATE.statsFilter==="all"){
     var filteredAll = allRealized.filter(function(r){ return inDateRange(r.sellDate, STATE.statsDateFilter); });
@@ -986,7 +1182,8 @@ function viewStats(L){
     out += '<div class="chartbox" id="chart_all_cum"><div class="ctitle-row"><div class="ctitle">已實現損益走勢（'+periodTitle+'）</div>'
       + '<span class="dlbtn" data-dlchart="chart_all_cum" data-dlname="累積損益走勢_全部">下載 PNG</span></div>'+lineChartSVG(pts)+'</div>'
       + '<div class="chartbox" id="chart_all_bar"><div class="ctitle-row"><div class="ctitle">各標的已實現損益</div>'
-      + '<span class="dlbtn" data-dlchart="chart_all_bar" data-dlname="各標的已實現損益">下載 PNG</span></div>'+barChartSVG(items)+'</div>';
+      + '<span class="dlbtn" data-dlchart="chart_all_bar" data-dlname="各標的已實現損益">下載 PNG</span></div>'+barChartSVG(items)+'</div>'
+      + periodSummaryHTML(filteredAll);
   }else{
     var lg = L[STATE.statsFilter];
     var stock=null;
@@ -996,19 +1193,26 @@ function viewStats(L){
       return a.sellDate<b.sellDate?-1:a.sellDate>b.sellDate?1:0; });
     var trades = allTrades.filter(function(r){ return inDateRange(r.sellDate, STATE.statsDateFilter); });
 
-    var periodTotal=0, wins=0, losses=0;
+    var periodTotal=0, periodCost=0, wins=0, losses=0;
     for(var r=0;r<trades.length;r++){
       periodTotal += trades[r].profit;
+      periodCost += trades[r].cost;
       if(trades[r].profit>=0) wins++; else losses++;
     }
+    var periodRoi = periodCost>0 ? periodTotal/periodCost*100 : 0;
+    var winRate = trades.length>0 ? (wins/trades.length*100) : 0;
 
     out += '<div class="card">'
       + '<div class="rb"><div><span class="sname">'+esc(stock?stock.name:"")+'</span>'
       + '<span class="scode">'+esc(stock?stock.code:"")+'</span></div>'
-      + '<span class="num '+(periodTotal>=0?"gain":"loss")+'" style="font-weight:700;font-size:17px">'
-      + money(periodTotal)+'</span></div>'
+      + '<div style="text-align:right">'
+      + '<div class="num '+(periodTotal>=0?"gain":"loss")+'" style="font-weight:700;font-size:17px">'
+      + money(periodTotal)+'</div>'
+      + '<div class="num '+(periodTotal>=0?"gain":"loss")+'" style="font-size:12.5px;font-weight:700">'+pct(periodRoi)+'</div>'
+      + '</div></div>'
       + '<div class="muted" style="margin-top:8px">'
-      + trades.length+' 次進出 ・ 賺 '+wins+' 次 ・ 賠 '+losses+' 次'
+      + '投入成本 '+money(periodCost)+'<br>'
+      + trades.length+' 次進出 ・ 賺 '+wins+' 次 ・ 賠 '+losses+' 次 ・ 勝率 '+winRate.toFixed(0)+'%'
       + (lg.holdingShares>0.001 ? ' ・ 目前持有 '+lots(lg.holdingShares) : '')
       + (STATE.statsDateFilter.type!=="all" ? ' ・ <span class="muted">（此為篩選區間內數字，非全部區間）</span>' : '')
       + '</div></div>';
@@ -1025,7 +1229,8 @@ function viewStats(L){
       out += '<div class="chartbox" id="chart_one_cum"><div class="ctitle-row"><div class="ctitle">累積已實現損益</div>'
         + '<span class="dlbtn" data-dlchart="chart_one_cum" data-dlname="'+esc(stockNameSafe)+'_累積損益">下載 PNG</span></div>'+lineChartSVG(tpts)+'</div>'
         + '<div class="chartbox" id="chart_one_bar"><div class="ctitle-row"><div class="ctitle">每筆進出損益</div>'
-        + '<span class="dlbtn" data-dlchart="chart_one_bar" data-dlname="'+esc(stockNameSafe)+'_每筆損益">下載 PNG</span></div>'+tradeBarSVG(trades)+'</div>';
+        + '<span class="dlbtn" data-dlchart="chart_one_bar" data-dlname="'+esc(stockNameSafe)+'_每筆損益">下載 PNG</span></div>'+tradeBarSVG(trades)+'</div>'
+        + periodSummaryHTML(trades);
     }
   }
 
@@ -1046,32 +1251,72 @@ function openModal(html){
 }
 function closeModal(){ if(modalEl){ modalEl.remove(); modalEl=null; } }
 
-function addTxnModal(){
-  var opts="";
+function stockOptionsHTML(selectedId, keyword){
+  var kw = (keyword||"").trim().toLowerCase();
+  var out="", matched=0;
   for(var i=0;i<STATE.stocks.length;i++){
-    opts += '<option value="'+STATE.stocks[i].id+'">'+esc(STATE.stocks[i].name)+'（'+esc(STATE.stocks[i].code)+'）</option>';
+    var s=STATE.stocks[i];
+    var hit = true;
+    if(kw){
+      var hay = (s.name+" "+(s.code||"")).toLowerCase();
+      hit = hay.indexOf(kw)!==-1;
+    }
+    if(hit) matched++;
+    // 保留目前選中的標的，避免搜尋時把選擇弄丟
+    if(!hit && s.id!==selectedId) continue;
+    out += '<option value="'+s.id+'"'+(s.id===selectedId?" selected":"")+'>'
+      + esc(s.name)+(s.code?'（'+esc(s.code)+'）':'')+'</option>';
   }
+  if(out==="") out = '<option value="">目前沒有任何標的</option>';
+  return { html: out, matched: matched };
+}
+
+function txnFormModal(editTxn){
+  var isEdit = !!editTxn;
+  var cur = editTxn || {};
+  var selId = isEdit ? cur.stockId : (STATE.stocks[0] ? STATE.stocks[0].id : "");
+  var curLots = isEdit ? (cur.shares/1000) : "";
+
+  var affectedNote = "";
+  if(isEdit){
+    var lgWarn = ledgerFor(cur.stockId);
+    if(lgWarn.realized.length>0){
+      affectedNote = '<div class="warn">改動這筆交易，會讓這支標的後續的已實現損益全部重新計算，'
+        + '「統計圖表」跟首頁的數字也會跟著變。這是正常的，代表程式重新照新資料配對了一次。</div>';
+    }
+  }
+
   openModal(
     '<button class="x" data-act="close">✕</button>'
-    + '<h3 class="mtitle">新增交易</h3>'
-    + '<div class="seg"><button class="b on" data-type="buy">買進</button><button class="s" data-type="sell">賣出</button></div>'
-    + '<div class="field"><label>標的</label><select id="f_stock">'+opts+'</select>'
+    + '<h3 class="mtitle">'+(isEdit?"編輯交易":"新增交易")+'</h3>'
+    + affectedNote
+    + '<div class="seg">'
+    + '<button class="b'+((!isEdit||cur.type==="buy")?" on":"")+'" data-type="buy">買進</button>'
+    + '<button class="s'+((isEdit&&cur.type==="sell")?" on":"")+'" data-type="sell">賣出</button></div>'
+    + '<div class="field"><label>標的</label>'
+    + '<input id="f_stocksearch" placeholder="輸入名稱或代碼可快速篩選" style="margin-bottom:8px">'
+    + '<select id="f_stock">'+stockOptionsHTML(selId,"").html+'</select>'
+    + '<div class="helper" id="searchhint"></div>'
     + '<span class="addlink" data-act="togglenew">＋ 新增標的</span>'
     + '<div class="newstock" id="newstock" style="display:none">'
     + '<input id="f_newname" placeholder="名稱，如：台積電"><input id="f_newcode" placeholder="代碼">'
     + '<button class="btn btn-g" data-act="addstock">加入</button></div></div>'
-    + '<div class="field"><label>成交日期</label><input type="date" id="f_date" value="'+today()+'"></div>'
+    + '<div class="field"><label>成交日期</label><input type="date" id="f_date" max="'+today()+'" value="'+(isEdit?esc(cur.date):today())+'"></div>'
     + '<div class="field"><label>張數（1 張 = 1000 股，可填小數）</label>'
-    + '<input type="number" step="0.001" inputmode="decimal" id="f_lots" placeholder="例如 1"></div>'
+    + '<input type="number" step="0.001" inputmode="decimal" id="f_lots" placeholder="例如 1" value="'+curLots+'"></div>'
     + '<div class="field"><label>成交單價</label>'
-    + '<input type="number" step="0.01" inputmode="decimal" id="f_price" placeholder="例如 70.55">'
+    + '<input type="number" step="0.01" inputmode="decimal" id="f_price" placeholder="例如 70.55" value="'+(isEdit?cur.price:"")+'">'
     + '<div class="helper" id="nominal"></div></div>'
     + '<div class="field"><label>含稅金成本價（實際扣款／入帳金額，留空則用名目金額）</label>'
-    + '<input type="number" step="1" inputmode="numeric" id="f_cost" placeholder="例如 70650"></div>'
+    + '<input type="number" step="1" inputmode="numeric" id="f_cost" placeholder="例如 70650" value="'+(isEdit?cur.costWithTax:"")+'"></div>'
+    + '<div class="field"><label>備註（選填）</label>'
+    + '<input id="f_note" maxlength="60" placeholder="例如：停損出場" value="'+(isEdit&&cur.note?esc(cur.note):"")+'"></div>'
     + '<div class="acts"><button class="btn btn-g btn-blk" data-act="close">取消</button>'
-    + '<button class="btn btn-p btn-blk" data-act="save">儲存</button></div>'
+    + '<button class="btn btn-p btn-blk" data-act="save">'+(isEdit?"儲存變更":"儲存")+'</button></div>'
   );
-  modalEl.dataset.type="buy";
+  modalEl.dataset.type = isEdit ? cur.type : "buy";
+  if(isEdit) modalEl.dataset.editid = cur.id;
+
   var upd=function(){
     var l=parseFloat(document.getElementById("f_lots").value)||0;
     var p=parseFloat(document.getElementById("f_price").value)||0;
@@ -1079,7 +1324,23 @@ function addTxnModal(){
   };
   document.getElementById("f_lots").addEventListener("input",upd);
   document.getElementById("f_price").addEventListener("input",upd);
+  upd();
+
+  document.getElementById("f_stocksearch").addEventListener("input", function(){
+    var sel = document.getElementById("f_stock");
+    var keep = sel.value;
+    var res = stockOptionsHTML(keep, this.value);
+    sel.innerHTML = res.html;
+    if(!sel.value && sel.options.length) sel.selectedIndex = 0;
+    var hint = document.getElementById("searchhint");
+    var kw = this.value.trim();
+    if(!kw) hint.textContent = "";
+    else if(res.matched===0) hint.textContent = "找不到符合「"+kw+"」的標的，可用下方「＋ 新增標的」建立";
+    else hint.textContent = "符合 "+res.matched+" 檔";
+  });
 }
+
+function addTxnModal(){ txnFormModal(null); }
 
 function settingsModal(){
   var body='<button class="x" data-act="close">✕</button><h3 class="mtitle">設定</h3>';
@@ -1121,6 +1382,20 @@ function settingsModal(){
 
   body += '<div class="srow" style="margin-top:18px"><span class="muted">交易筆數</span><span>'+STATE.txns.length+' 筆</span></div>'
     + '<div class="srow"><span class="muted">標的數</span><span>'+STATE.stocks.length+' 檔</span></div>';
+
+  var isFifo = (STATE.costMethod||"fifo")==="fifo";
+  body += '<div style="margin-top:18px;padding-top:16px;border-top:1px solid var(--line)">'
+    + '<div class="muted" style="margin-bottom:8px">賣出時，成本要怎麼算？</div>'
+    + '<div class="seg" style="margin-bottom:8px">'
+    + '<button class="'+(isFifo?"on b":"")+'" data-method="fifo">先進先出</button>'
+    + '<button class="'+(!isFifo?"on b":"")+'" data-method="avg">平均成本</button>'
+    + '</div>'
+    + '<div class="muted" style="font-size:11.5px;line-height:1.7">'
+    + (isFifo
+        ? '<b>先進先出</b>：賣出時當作賣掉的是「最早買的那批」，用那批的成本計算。跟券商對帳單、國稅局的算法一致。'
+        : '<b>平均成本</b>：賣出時用「手上所有股票的平均成本」計算，不分哪一批先買。一般人心算時多半是這樣想。')
+    + '<br><br>只有「買了好幾批、只賣掉一部分」時兩種算法才會有差；整批買整批賣的話，結果完全一樣。切換不會動到你的紀錄，隨時可以換回來。</div>'
+    + '</div>';
 
   body += '<button class="btn btn-p btn-blk" style="margin-top:16px" data-act="opentutorial">📖 使用說明</button>';
 
@@ -1226,6 +1501,14 @@ function tutorialModal(){
     + '剩下的 500 股用第二批去配（賺了 (300-200)×500 = 50,000），加起來這次總共賺 250,000。'
     + '你完全不用自己算這些，程式會自動配對，「歷史紀錄」跟「統計圖表」看到的損益數字都是這樣算出來的。</p>'
 
+    + '<div '+H+'>兩種成本算法（設定裡可切換）</div>'
+    + '<p '+S+'>接續上面的例子。如果三批都賣光了，兩種算法的總金額<b>完全一樣</b>，不用煩惱選哪個。'
+    + '只有「買了好幾批、只賣掉一部分」的時候才會有差：</p>'
+    + '<p '+S+'>• <b>先進先出</b>：當作先賣掉最早買的那批，用那批的成本算。券商對帳單和報稅是用這個<br>'
+    + '• <b>平均成本</b>：用手上全部股票的平均成本算，不分先後</p>'
+    + '<p '+S+'>差別只在「這次認列多少、剩下的留到以後認列多少」，等全部賣完，總數還是一樣。'
+    + '在「設定」裡隨時可以切換，切換不會動到任何一筆紀錄。</p>'
+
     + '<div '+H+'>三個頁籤分別在看什麼</div>'
     + '<p '+S+'>• <b>持有中</b>：現在手上還沒賣掉的股票，有多少張、平均成本多少<br>'
     + '• <b>歷史紀錄</b>：每一筆買賣的紀錄，可以切換「依時間」（照日期排）或「依標的」（同一支股票收在一起看）<br>'
@@ -1297,7 +1580,7 @@ function toast(msg){
    事件處理
    ======================================================================= */
 document.addEventListener("click", function(e){
-  var t = e.target.closest("[data-tab],[data-act],[data-del],[data-type],[data-hmode],[data-delstock],[data-dlchart]");
+  var t = e.target.closest("[data-tab],[data-act],[data-del],[data-edit],[data-type],[data-hmode],[data-delstock],[data-dlchart],[data-method]");
   if(!t) return;
 
   if(t.dataset.tab){
@@ -1307,6 +1590,24 @@ document.addEventListener("click", function(e){
   }
   if(t.dataset.hmode){
     STATE.historyMode=t.dataset.hmode; render(); return;
+  }
+  if(t.dataset.method){
+    if(STATE.costMethod !== t.dataset.method){
+      STATE.costMethod = t.dataset.method;
+      localStorage.setItem(METHOD_KEY, STATE.costMethod);
+      render();
+      settingsModal();
+      toast(STATE.costMethod==="fifo" ? "已改用先進先出" : "已改用平均成本");
+    }
+    return;
+  }
+  if(t.dataset.edit){
+    var target=null;
+    for(var ei=0;ei<STATE.txns.length;ei++){
+      if(STATE.txns[ei].id===t.dataset.edit){ target=STATE.txns[ei]; break; }
+    }
+    if(target) txnFormModal(target);
+    return;
   }
   if(t.dataset.del){
     if(confirm("確定要刪除這筆紀錄嗎？")){
@@ -1422,22 +1723,44 @@ document.addEventListener("click", function(e){
   else if(act==="save"){
     var stockId=document.getElementById("f_stock").value;
     var date=document.getElementById("f_date").value;
-    var lotsV=parseFloat(document.getElementById("f_lots").value);
-    var price=parseFloat(document.getElementById("f_price").value);
+    var lotsRaw=document.getElementById("f_lots").value;
+    var priceRaw=document.getElementById("f_price").value;
     var costV=document.getElementById("f_cost").value;
-    if(!stockId){ alert("請選擇標的"); return; }
-    if(!date){ alert("請選擇成交日期"); return; }
-    if(!lotsV || lotsV<=0){ alert("請填寫張數"); return; }
-    if(!price || price<=0){ alert("請填寫成交單價"); return; }
-    var shares=lotsV*1000;
+    var noteEl=document.getElementById("f_note");
+    var noteV=noteEl ? noteEl.value.trim() : "";
+
+    var errMsg = validateTxnFields({stockId:stockId, date:date, lots:lotsRaw, price:priceRaw, cost:costV});
+    if(errMsg){ alert(errMsg); return; }
+
+    var shares=parseFloat(lotsRaw)*1000;
+    var price=parseFloat(priceRaw);
     var nominal=shares*price;
-    STATE.txns.push({
-      id:uid("t"), stockId:stockId, type:modalEl.dataset.type||"buy",
-      date:date, shares:shares, price:price,
-      costWithTax: costV!=="" ? parseFloat(costV) : nominal,
-      createdAt:Date.now()
-    });
-    closeModal(); commit(); toast("已新增一筆紀錄");
+    var finalCost = costV!=="" ? parseFloat(costV) : nominal;
+    var editId = modalEl.dataset.editid;
+
+    if(editId){
+      for(var ti=0; ti<STATE.txns.length; ti++){
+        if(STATE.txns[ti].id===editId){
+          STATE.txns[ti].stockId = stockId;
+          STATE.txns[ti].type = modalEl.dataset.type||"buy";
+          STATE.txns[ti].date = date;
+          STATE.txns[ti].shares = shares;
+          STATE.txns[ti].price = price;
+          STATE.txns[ti].costWithTax = finalCost;
+          STATE.txns[ti].note = noteV;
+          break;
+        }
+      }
+      closeModal(); commit(); toast("已更新這筆紀錄");
+    }else{
+      STATE.txns.push({
+        id:uid("t"), stockId:stockId, type:modalEl.dataset.type||"buy",
+        date:date, shares:shares, price:price,
+        costWithTax: finalCost, note: noteV,
+        createdAt:Date.now()
+      });
+      closeModal(); commit(); toast("已新增一筆紀錄");
+    }
   }
   else if(act==="newroom"){
     var code=(uid("room").replace(/[^a-z0-9]/gi,"")+Math.random().toString(36).slice(2)).slice(0,24);
@@ -1501,8 +1824,20 @@ document.addEventListener("click", function(e){
     var txt = document.getElementById("f_importtext").value;
     var parsed = parseImportText(txt);
     var box = document.getElementById("import_preview");
+    var dupTotal = parsed.dupExisting.length + parsed.dupInFile.length;
+    var dupBox = "";
+    if(dupTotal>0){
+      dupBox = '<div class="warn">已自動跳過 '+dupTotal+' 筆重複資料：'
+        + (parsed.dupExisting.length ? '<br>• 其中 '+parsed.dupExisting.length+' 筆已經在紀錄裡（避免重複匯入造成損益翻倍）' : '')
+        + (parsed.dupInFile.length ? '<br>• 其中 '+parsed.dupInFile.length+' 筆是這次貼上的內容裡自己重複的' : '')
+        + '<div style="margin-top:6px;font-size:11.5px">'
+        + parsed.dupExisting.concat(parsed.dupInFile).slice(0,5).map(esc).join('<br>')
+        + (dupTotal>5?'<br>…':'') + '</div></div>';
+    }
+
     if(parsed.rows.length===0){
-      box.innerHTML = '<div class="warn">沒有解析出任何可匯入的資料。'+(parsed.errors.length?'<br>'+parsed.errors.slice(0,6).join('<br>'):'')+'</div>';
+      box.innerHTML = dupBox
+        + '<div class="warn">沒有新的資料可以匯入。'+(parsed.errors.length?'<br>'+parsed.errors.slice(0,6).map(esc).join('<br>'):'')+'</div>';
       return;
     }
     var summary = '<div class="warn" style="background:#E7F3ED;color:var(--loss)">'
@@ -1512,7 +1847,7 @@ document.addEventListener("click", function(e){
     var errBox = parsed.errors.length
       ? '<div class="warn">'+parsed.errors.length+' 行無法解析，已略過：<br>'+parsed.errors.slice(0,6).map(esc).join('<br>')+(parsed.errors.length>6?'<br>…':'')+'</div>'
       : '';
-    box.innerHTML = summary + errBox
+    box.innerHTML = summary + dupBox + errBox
       + '<button class="btn btn-p btn-blk" style="margin-top:10px" data-act="confirmimport">確認匯入 '+parsed.rows.length+' 筆</button>';
     box.dataset.rows = JSON.stringify(parsed.rows);
     box.dataset.newstocks = JSON.stringify(parsed.newStockNames);
