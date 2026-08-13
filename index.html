@@ -278,6 +278,15 @@ function allLedgers(){
 /* ---------- 雲端同步（可選，失敗不影響本機使用） ---------- */
 var fbUnsub = null;
 var fbReadyLoaded = false;
+var pendingSyncConflict = null; // { stocks, txns }
+
+function txnsDiffer(a, b){
+  if(a.length !== b.length) return true;
+  var idsA = a.map(function(x){ return x.id; }).slice().sort();
+  var idsB = b.map(function(x){ return x.id; }).slice().sort();
+  for(var i=0;i<idsA.length;i++) if(idsA[i]!==idsB[i]) return true;
+  return false;
+}
 var fbConnectTimeout = null;
 
 function loadFirebaseScripts(cb){
@@ -327,6 +336,7 @@ function clearFirebaseConfig(){
 function startSync(){
   if(!FIREBASE_READY || !STATE.syncCode) return;
   STATE.syncStatus="connecting"; STATE.syncError=null; render();
+  var firstSnapshot = true;
   loadFirebaseScripts(function(ok){
     if(!ok || typeof firebase==="undefined"){
       STATE.syncStatus="error";
@@ -339,21 +349,38 @@ function startSync(){
       var ref=db.collection("dadStockRooms").doc(STATE.syncCode);
       if(fbUnsub) fbUnsub();
       fbUnsub = ref.onSnapshot(function(snap){
-        STATE.syncStatus="connected"; STATE.syncError=null;
         if(snap.exists){
           var d=snap.data();
-          if(d.stocks && d.stocks.length) STATE.stocks=d.stocks;
-          STATE.txns = d.txns || [];
+          var cloudStocks = d.stocks || [];
+          var cloudTxns = d.txns || [];
+
+          if(firstSnapshot){
+            firstSnapshot = false;
+            if(STATE.txns.length>0 && txnsDiffer(STATE.txns, cloudTxns)){
+              pendingSyncConflict = { stocks: cloudStocks, txns: cloudTxns };
+              STATE.syncStatus = "conflict";
+              render();
+              showSyncConflictModal(STATE.txns.length, cloudTxns.length);
+              return;
+            }
+          }
+
+          STATE.syncStatus="connected"; STATE.syncError=null;
+          if(cloudStocks.length) STATE.stocks=cloudStocks;
+          STATE.txns = cloudTxns;
           saveLocal();
+          render();
         }else{
+          firstSnapshot=false;
+          STATE.syncStatus="connected"; STATE.syncError=null;
           ref.set({stocks:STATE.stocks, txns:STATE.txns, updatedAt:Date.now()})
             .catch(function(werr){
               STATE.syncStatus="error";
               STATE.syncError=(werr && werr.code ? "["+werr.code+"] " : "")+(werr && werr.message ? werr.message : String(werr));
               render();
             });
+          render();
         }
-        render();
       }, function(err){
         console.warn("同步錯誤", err);
         STATE.syncStatus="error";
@@ -669,10 +696,12 @@ function render(){
     syncTxt = '雲端同步中';
   }else if(STATE.syncStatus==="error"){
     syncTxt = '同步失敗，資料仍保存在這台裝置 <span class="link" data-act="opensettings">查看原因</span>';
+  }else if(STATE.syncStatus==="conflict"){
+    syncTxt = '⚠ 本機和雲端資料不同，需要你決定 <span class="link" data-act="reopenconflict">處理</span>';
   }else{
     syncTxt = '連線中…';
   }
-  var dotCls = STATE.syncStatus==="connected"?"on":STATE.syncStatus==="error"?"off":"";
+  var dotCls = STATE.syncStatus==="connected"?"on":(STATE.syncStatus==="error"||STATE.syncStatus==="conflict")?"off":"";
 
   html += '<header class="top">'
     + '<h1 class="title">📒 股票存摺</h1>'
@@ -981,7 +1010,9 @@ function settingsModal(){
       + '<span class="addlink" data-act="openfbsetup">重新設定雲端連線</span>';
   }else{
     var st = STATE.syncStatus==="connected" ? "✅ 已連線"
-           : STATE.syncStatus==="error" ? "❌ 連線失敗" : "連線中…";
+           : STATE.syncStatus==="error" ? "❌ 連線失敗"
+           : STATE.syncStatus==="conflict" ? "⚠ 待處理：本機與雲端資料不同"
+           : "連線中…";
     body += '<div class="srow"><span class="muted">連線狀態</span><span>'+st+'</span></div>';
     if(STATE.syncStatus==="error" && STATE.syncError){
       body += '<div class="warn" style="margin:8px 0 0">'
@@ -989,6 +1020,10 @@ function settingsModal(){
         + '<div style="margin-top:8px;font-size:12px">資料仍安全存在這台裝置。把上面這段錯誤訊息截圖給我，我可以直接判斷原因；常見原因是 Firestore 規則沒發布、或資料庫還在建立中。</div>'
         + '</div>'
         + '<button class="btn btn-g btn-blk" style="margin-top:10px" data-act="retrysync">重新連線</button>';
+    }
+    if(STATE.syncStatus==="conflict"){
+      body += '<div class="warn" style="margin:8px 0 0">本機和雲端的資料不一樣，需要你決定保留哪一份，才會繼續同步。'
+        + '<button class="btn btn-p btn-blk" style="margin-top:10px" data-act="reopenconflict">處理資料衝突</button></div>';
     }
     body += '<div class="srow" style="flex-direction:column;align-items:flex-start;gap:8px;margin-top:8px">'
       + '<span class="muted">同步代碼（請抄下或截圖，其他裝置要用）</span>'
@@ -1061,6 +1096,21 @@ function stockManageModal(){
 }
 
 /* ---------- 子面板：從 Excel 貼上匯入 ---------- */
+/* ---------- 子面板：同步衝突處理 ---------- */
+function showSyncConflictModal(localCount, cloudCount){
+  var body = '<button class="x" data-act="conflict_cancel">✕</button>'
+    + '<h3 class="mtitle">本機和雲端的資料不一樣</h3>'
+    + '<div class="warn">這組同步代碼在雲端已經有資料，跟這台裝置本機記錄的不同，需要你決定要保留哪一份，兩份不會自動合併。</div>'
+    + '<div class="card">'
+    + '<div class="rb"><span class="muted">本機（這台裝置）</span><span style="font-weight:700">'+localCount+' 筆交易</span></div>'
+    + '<div class="rb" style="margin-top:8px"><span class="muted">雲端（這組代碼）</span><span style="font-weight:700">'+cloudCount+' 筆交易</span></div>'
+    + '</div>'
+    + '<button class="btn btn-p btn-blk" style="margin-top:16px" data-act="conflict_usecloud">使用雲端資料（覆蓋本機）</button>'
+    + '<button class="btn btn-g btn-blk" style="margin-top:10px" data-act="conflict_uselocal">使用本機資料（覆蓋雲端）</button>'
+    + '<button class="btn btn-g btn-blk" style="margin-top:10px" data-act="conflict_cancel">取消，不同步這組代碼</button>';
+  openModal(body);
+}
+
 function importModal(){
   var body = '<button class="x" data-act="close">✕</button><h3 class="mtitle">從 Excel 貼上匯入</h3>'
     + '<p class="muted" style="margin-top:0">直接從 Excel 選取這幾欄複製，貼到下面：<b>日期、標的名稱、買/賣、單價、股數</b>（含稅金成本價可放第 6 或第 7 欄，非必要）。'
@@ -1166,6 +1216,32 @@ document.addEventListener("click", function(e){
   else if(act==="close")     closeModal();
   else if(act==="opensettings") settingsModal();
   else if(act==="retrysync") startSync();
+  else if(act==="reopenconflict"){
+    if(pendingSyncConflict) showSyncConflictModal(STATE.txns.length, pendingSyncConflict.txns.length);
+  }
+  else if(act==="conflict_usecloud"){
+    if(pendingSyncConflict){
+      if(pendingSyncConflict.stocks.length) STATE.stocks = pendingSyncConflict.stocks;
+      STATE.txns = pendingSyncConflict.txns;
+      saveLocal();
+      pendingSyncConflict = null;
+      STATE.syncStatus = "connected"; STATE.syncError = null;
+      closeModal(); render(); toast("已改用雲端資料");
+    }
+  }
+  else if(act==="conflict_uselocal"){
+    pendingSyncConflict = null;
+    STATE.syncStatus = "connected"; STATE.syncError = null;
+    pushCloud();
+    closeModal(); render(); toast("已用本機資料覆蓋雲端");
+  }
+  else if(act==="conflict_cancel"){
+    if(fbUnsub){ fbUnsub(); fbUnsub=null; }
+    pendingSyncConflict = null;
+    STATE.syncCode = ""; STATE.syncStatus = "idle"; STATE.syncError = null;
+    localStorage.removeItem(CODE_KEY);
+    closeModal(); render(); toast("已取消，資料未變動");
+  }
   else if(act==="export")    exportBackup();
   else if(act==="triggerrestore"){
     var inp = document.getElementById("backupFileInput");
