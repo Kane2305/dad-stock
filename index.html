@@ -204,7 +204,8 @@ var STATE = {
   statsFilter: "all",   // "all" 或某個 stockId
   historyMode: "time",  // "time" 依時間 | "stock" 依標的
   syncCode: "",
-  syncStatus: "idle"   // idle | connecting | connected | error
+  syncStatus: "idle",   // idle | connecting | connected | error
+  syncError: null
 };
 
 var LOCAL_KEY = "dadstock_data_v2";
@@ -321,10 +322,12 @@ function clearFirebaseConfig(){
 
 function startSync(){
   if(!FIREBASE_READY || !STATE.syncCode) return;
-  STATE.syncStatus="connecting"; render();
+  STATE.syncStatus="connecting"; STATE.syncError=null; render();
   loadFirebaseScripts(function(ok){
     if(!ok || typeof firebase==="undefined"){
-      STATE.syncStatus="error"; render(); return;
+      STATE.syncStatus="error";
+      STATE.syncError="Firebase 元件下載失敗（通常是網路問題，或網路擋掉了 gstatic.com）";
+      render(); return;
     }
     try{
       if(!firebase.apps.length) firebase.initializeApp(FIREBASE_CONFIG);
@@ -332,22 +335,32 @@ function startSync(){
       var ref=db.collection("dadStockRooms").doc(STATE.syncCode);
       if(fbUnsub) fbUnsub();
       fbUnsub = ref.onSnapshot(function(snap){
-        STATE.syncStatus="connected";
+        STATE.syncStatus="connected"; STATE.syncError=null;
         if(snap.exists){
           var d=snap.data();
           if(d.stocks && d.stocks.length) STATE.stocks=d.stocks;
           STATE.txns = d.txns || [];
           saveLocal();
         }else{
-          ref.set({stocks:STATE.stocks, txns:STATE.txns, updatedAt:Date.now()});
+          ref.set({stocks:STATE.stocks, txns:STATE.txns, updatedAt:Date.now()})
+            .catch(function(werr){
+              STATE.syncStatus="error";
+              STATE.syncError=(werr && werr.code ? "["+werr.code+"] " : "")+(werr && werr.message ? werr.message : String(werr));
+              render();
+            });
         }
         render();
       }, function(err){
         console.warn("同步錯誤", err);
-        STATE.syncStatus="error"; render();
+        STATE.syncStatus="error";
+        STATE.syncError=(err && err.code ? "["+err.code+"] " : "")+(err && err.message ? err.message : String(err));
+        render();
       });
     }catch(e){
-      console.warn(e); STATE.syncStatus="error"; render();
+      console.warn(e);
+      STATE.syncStatus="error";
+      STATE.syncError=(e && e.code ? "["+e.code+"] " : "")+(e && e.message ? e.message : String(e));
+      render();
     }
   });
 }
@@ -356,7 +369,15 @@ function pushCloud(){
   try{
     firebase.firestore().collection("dadStockRooms").doc(STATE.syncCode)
       .set({stocks:STATE.stocks, txns:STATE.txns, updatedAt:Date.now()})
-      .catch(function(e){ console.warn("寫入失敗", e); });
+      .then(function(){
+        if(STATE.syncStatus==="error"){ STATE.syncStatus="connected"; STATE.syncError=null; render(); }
+      })
+      .catch(function(e){
+        console.warn("寫入失敗", e);
+        STATE.syncStatus="error";
+        STATE.syncError=(e && e.code ? "["+e.code+"] " : "")+(e && e.message ? e.message : String(e));
+        render();
+      });
   }catch(e){ console.warn(e); }
 }
 function commit(){ saveLocal(); pushCloud(); render(); }
@@ -610,7 +631,7 @@ function render(){
   }else if(STATE.syncStatus==="connected"){
     syncTxt = '雲端同步中';
   }else if(STATE.syncStatus==="error"){
-    syncTxt = '同步失敗，資料仍保存在這台裝置 <span class="link" data-act="retrysync">重試</span>';
+    syncTxt = '同步失敗，資料仍保存在這台裝置 <span class="link" data-act="opensettings">查看原因</span>';
   }else{
     syncTxt = '連線中…';
   }
@@ -918,9 +939,16 @@ function settingsModal(){
       + '<span class="addlink" data-act="openfbsetup">重新設定雲端連線</span>';
   }else{
     var st = STATE.syncStatus==="connected" ? "✅ 已連線"
-           : STATE.syncStatus==="error" ? "❌ 連線失敗（資料仍在本機）" : "連線中…";
-    body += '<div class="srow"><span class="muted">連線狀態</span><span>'+st+'</span></div>'
-      + '<div class="srow" style="flex-direction:column;align-items:flex-start;gap:8px">'
+           : STATE.syncStatus==="error" ? "❌ 連線失敗" : "連線中…";
+    body += '<div class="srow"><span class="muted">連線狀態</span><span>'+st+'</span></div>';
+    if(STATE.syncStatus==="error" && STATE.syncError){
+      body += '<div class="warn" style="margin:8px 0 0">'
+        + '<b>錯誤訊息：</b><br><span style="font-family:ui-monospace,monospace;font-size:11.5px">'+esc(STATE.syncError)+'</span>'
+        + '<div style="margin-top:8px;font-size:12px">資料仍安全存在這台裝置。把上面這段錯誤訊息截圖給我，我可以直接判斷原因；常見原因是 Firestore 規則沒發布、或資料庫還在建立中。</div>'
+        + '</div>'
+        + '<button class="btn btn-g btn-blk" style="margin-top:10px" data-act="retrysync">重新連線</button>';
+    }
+    body += '<div class="srow" style="flex-direction:column;align-items:flex-start;gap:8px;margin-top:8px">'
       + '<span class="muted">同步代碼（請抄下或截圖，其他裝置要用）</span>'
       + '<div class="codebox">'+esc(STATE.syncCode)+'</div></div>'
       + '<button class="btn btn-g btn-blk" style="margin-top:14px" data-act="leaveroom">中斷這台裝置的同步</button>';
