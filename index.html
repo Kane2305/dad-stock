@@ -217,7 +217,17 @@ function uid(p){ return p+"_"+Date.now().toString(36)+Math.random().toString(36)
 function esc(s){ return String(s==null?"":s).replace(/[&<>"']/g,function(c){
   return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]; }); }
 function money(n){ var v=Math.round(n); return (v<0?"-":"")+"$"+Math.abs(v).toLocaleString("zh-TW"); }
-function lots(sh){ var l=sh/1000; return (Number.isInteger(l)?l:l.toFixed(2))+" 張"; }
+function lots(sh){
+  var n = Math.round(sh);
+  if((STATE.qtyUnit||"share")==="lot"){
+    var v = n/1000;
+    // 精確到 1 股（0.001 張），並去掉多餘的 0
+    var s = v.toFixed(3).replace(/\.?0+$/, "");
+    if(s==="" || s==="-") s = "0";
+    return s+" 張";
+  }
+  return n.toLocaleString("zh-TW")+" 股";
+}
 function today(){ var d=new Date(); return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0"); }
 function pct(n){ return (n>=0?"+":"")+n.toFixed(2)+"%"; }
 
@@ -227,8 +237,21 @@ function validateTxnFields(f){
   if(!f.stockId) return "請選擇標的";
   if(!f.date) return "請選擇成交日期";
   if(f.date > today()) return "成交日期不能是未來的日期，請確認年份有沒有打錯";
-  var lots = parseFloat(f.lots);
-  if(!lots || lots<=0 || !isFinite(lots)) return "請填寫正確的張數（要大於 0）";
+  var isLotMode = (STATE.qtyUnit||"share")==="lot";
+  var qty = parseFloat(f.lots);
+  if(!qty || qty<=0 || !isFinite(qty)){
+    return isLotMode ? "請填寫正確的張數（要大於 0）" : "請填寫正確的股數（要大於 0）";
+  }
+  var sharesRaw = isLotMode ? qty*1000 : qty;
+  if(Math.abs(sharesRaw - Math.round(sharesRaw)) > 1e-6){
+    return isLotMode
+      ? "張數最多只能到小數點後三位（0.001 張 = 1 股），沒有半股這種東西"
+      : "股數要填整數，沒有半股這種東西";
+  }
+  var shares = Math.round(sharesRaw);
+  if(shares < 1){
+    return isLotMode ? "張數太小了，最少要 0.001 張（= 1 股）" : "股數最少要 1 股";
+  }
   var price = parseFloat(f.price);
   if(!price || price<=0 || !isFinite(price)) return "請填寫正確的成交單價（要大於 0）";
   if(f.cost!==""){
@@ -252,6 +275,7 @@ var STATE = {
   statsRangeDraftOpen: false,
   costMethod: "fifo",   // fifo 先進先出 | avg 平均成本
   homeMetric: "realized",
+  qtyUnit: "share",   // share 股 | lot 張
   syncCode: "",
   syncStatus: "idle",   // idle | connecting | connected | error
   syncError: null
@@ -261,6 +285,7 @@ var LOCAL_KEY = "dadstock_data_v2";
 var CODE_KEY  = "dadstock_sync_code";
 var METHOD_KEY = "dadstock_cost_method";
 var METRIC_KEY = "dadstock_home_metric";
+var UNIT_KEY = "dadstock_qty_unit";
 
 function loadLocal(){
   try{
@@ -275,6 +300,8 @@ function loadLocal(){
     if(cm==="fifo" || cm==="avg") STATE.costMethod = cm;
     var hm = localStorage.getItem(METRIC_KEY);
     if(hm) STATE.homeMetric = hm;
+    var qu = localStorage.getItem(UNIT_KEY);
+    if(qu==="share" || qu==="lot") STATE.qtyUnit = qu;
   }catch(e){ console.warn("本機資料讀取失敗", e); }
 }
 function saveLocal(){
@@ -1357,7 +1384,11 @@ function txnFormModal(editTxn){
   var isEdit = !!editTxn;
   var cur = editTxn || {};
   var selId = isEdit ? cur.stockId : (STATE.stocks[0] ? STATE.stocks[0].id : "");
-  var curLots = isEdit ? (cur.shares/1000) : "";
+  var isLot = (STATE.qtyUnit||"share")==="lot";
+  var curQty = "";
+  if(isEdit){
+    curQty = isLot ? String(Number((cur.shares/1000).toFixed(3))) : String(Math.round(cur.shares));
+  }
 
   var affectedNote = "";
   if(isEdit){
@@ -1384,8 +1415,12 @@ function txnFormModal(editTxn){
     + '<input id="f_newname" placeholder="名稱，如：台積電"><input id="f_newcode" placeholder="代碼">'
     + '<button class="btn btn-g" data-act="addstock">加入</button></div></div>'
     + '<div class="field"><label>成交日期</label><input type="date" id="f_date" max="'+today()+'" value="'+(isEdit?esc(cur.date):today())+'"></div>'
-    + '<div class="field"><label>張數（1 張 = 1000 股，可填小數）</label>'
-    + '<input type="number" step="0.001" inputmode="decimal" id="f_lots" placeholder="例如 1" value="'+curLots+'"></div>'
+    + '<div class="field"><label>'
+    + (isLot ? '張數（1 張 = 1000 股，零股可填小數，如 0.062 = 62 股）' : '股數（1 張 = 1000 股）')
+    + '</label>'
+    + '<input type="number" step="'+(isLot?"0.001":"1")+'" min="0" inputmode="decimal" id="f_lots" placeholder="'
+    + (isLot?"例如 1 或 0.062":"例如 1000 或 62")+'" value="'+curQty+'">'
+    + '<div class="helper" id="qtyhint"></div></div>'
     + '<div class="field"><label>成交單價</label>'
     + '<input type="number" step="0.01" inputmode="decimal" id="f_price" placeholder="例如 70.55" value="'+(isEdit?cur.price:"")+'">'
     + '<div class="helper" id="nominal"></div></div>'
@@ -1400,9 +1435,15 @@ function txnFormModal(editTxn){
   if(isEdit) modalEl.dataset.editid = cur.id;
 
   var upd=function(){
-    var l=parseFloat(document.getElementById("f_lots").value)||0;
+    var raw=parseFloat(document.getElementById("f_lots").value)||0;
+    var sh = isLot ? Math.round(raw*1000) : Math.round(raw);
     var p=parseFloat(document.getElementById("f_price").value)||0;
-    document.getElementById("nominal").textContent = (l&&p) ? "名目金額："+money(l*1000*p) : "";
+    var qh=document.getElementById("qtyhint");
+    if(sh>0){
+      qh.textContent = isLot ? ("= "+sh.toLocaleString("zh-TW")+" 股")
+                             : ("= "+Number((sh/1000).toFixed(3))+" 張");
+    }else{ qh.textContent = ""; }
+    document.getElementById("nominal").textContent = (sh&&p) ? "名目金額："+money(sh*p) : "";
   };
   document.getElementById("f_lots").addEventListener("input",upd);
   document.getElementById("f_price").addEventListener("input",upd);
@@ -1476,6 +1517,19 @@ function settingsModal(){
     + '<select id="homeMetricSelect">'+metricOpts+'</select></div>'
     + '<div class="muted" style="font-size:11.5px">在首頁直接輕觸那張卡片，也可以快速切換到下一個。</div>'
     + '</div>';
+
+  var isLotUnit = (STATE.qtyUnit||"share")==="lot";
+  body += '<div style="margin-top:18px;padding-top:16px;border-top:1px solid var(--line)">'
+    + '<div class="muted" style="margin-bottom:8px">數量要用什麼單位顯示和輸入？</div>'
+    + '<div class="seg" style="margin-bottom:8px">'
+    + '<button class="'+(!isLotUnit?"on b":"")+'" data-unit="share">股</button>'
+    + '<button class="'+(isLotUnit?"on b":"")+'" data-unit="lot">張</button>'
+    + '</div>'
+    + '<div class="muted" style="font-size:11.5px;line-height:1.7">'
+    + (isLotUnit
+        ? '<b>張</b>：62 股會顯示成 0.062 張，輸入時也填張數。零股精確到小數點後三位（0.001 張 = 1 股），不會被四捨五入。'
+        : '<b>股</b>：直接用股數顯示和輸入，62 股就是 62 股。買零股的話這個比較直覺。')
+    + '</div></div>';
 
   var isFifo = (STATE.costMethod||"fifo")==="fifo";
   body += '<div style="margin-top:18px;padding-top:16px;border-top:1px solid var(--line)">'
@@ -1585,7 +1639,7 @@ function tutorialModal(){
     + '<p '+S+'>• <b>買進 / 賣出</b>：先選這筆是買還是賣<br>'
     + '• <b>標的</b>：選股票名稱，清單裡沒有的話按旁邊「＋新增標的」<br>'
     + '• <b>日期</b>：成交那天<br>'
-    + '• <b>張數</b>：1 張 = 1000 股，跟證券公司對帳單上寫的一樣<br>'
+    + '• <b>數量</b>：預設用「股」填，買 62 股就填 62。想改用「張」來填的話，到設定裡切換即可（1 張 = 1000 股，零股就填 0.062 這種小數）<br>'
     + '• <b>成交單價</b>：買進或賣出那個價格<br>'
     + '• <b>含稅金成本價</b>：扣掉（或加上）手續費、證交稅之後，實際入帳或扣款的金額。這欄留空的話，程式會用「單價 × 股數」自動算一個大概的數字，但跟證券公司對帳單上的實際金額會有一點誤差（差在手續費、稅金）</p>'
 
@@ -1679,7 +1733,7 @@ function toast(msg){
    事件處理
    ======================================================================= */
 document.addEventListener("click", function(e){
-  var t = e.target.closest("[data-tab],[data-act],[data-del],[data-edit],[data-type],[data-hmode],[data-delstock],[data-dlchart],[data-method]");
+  var t = e.target.closest("[data-tab],[data-act],[data-del],[data-edit],[data-type],[data-hmode],[data-delstock],[data-dlchart],[data-method],[data-unit]");
   if(!t) return;
 
   if(t.dataset.tab){
@@ -1689,6 +1743,16 @@ document.addEventListener("click", function(e){
   }
   if(t.dataset.hmode){
     STATE.historyMode=t.dataset.hmode; render(); return;
+  }
+  if(t.dataset.unit){
+    if(STATE.qtyUnit !== t.dataset.unit){
+      STATE.qtyUnit = t.dataset.unit;
+      localStorage.setItem(UNIT_KEY, STATE.qtyUnit);
+      render();
+      settingsModal();
+      toast(STATE.qtyUnit==="lot" ? "已改用「張」顯示" : "已改用「股」顯示");
+    }
+    return;
   }
   if(t.dataset.method){
     if(STATE.costMethod !== t.dataset.method){
@@ -1831,7 +1895,9 @@ document.addEventListener("click", function(e){
     var errMsg = validateTxnFields({stockId:stockId, date:date, lots:lotsRaw, price:priceRaw, cost:costV});
     if(errMsg){ alert(errMsg); return; }
 
-    var shares=parseFloat(lotsRaw)*1000;
+    var shares = (STATE.qtyUnit||"share")==="lot"
+      ? Math.round(parseFloat(lotsRaw)*1000)
+      : Math.round(parseFloat(lotsRaw));
     var price=parseFloat(priceRaw);
     var nominal=shares*price;
     var finalCost = costV!=="" ? parseFloat(costV) : nominal;
