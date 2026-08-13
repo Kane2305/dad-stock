@@ -121,6 +121,9 @@
 
   .chartbox{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
     box-shadow:var(--shadow);padding:16px;margin-bottom:12px;}
+  .ctitle-row{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px;}
+  .dlbtn{font-size:11.5px;color:var(--gold);font-weight:700;cursor:pointer;text-decoration:underline;
+    white-space:nowrap;flex:none;}
   .ctitle{font-size:13px;font-weight:700;color:var(--ink-soft);margin-bottom:12px;}
   svg{display:block;width:100%;height:auto;}
 
@@ -275,6 +278,7 @@ function allLedgers(){
 /* ---------- 雲端同步（可選，失敗不影響本機使用） ---------- */
 var fbUnsub = null;
 var fbReadyLoaded = false;
+var fbConnectTimeout = null;
 
 function loadFirebaseScripts(cb){
   if(fbReadyLoaded){ cb(true); return; }
@@ -524,7 +528,7 @@ function lineChartSVG(points){
     dots += '<circle cx="'+X(k).toFixed(1)+'" cy="'+Y(points[k].y).toFixed(1)+'" r="3" fill="#B98F3D"/>';
   }
 
-  return '<svg viewBox="0 0 '+W+' '+H+'" role="img" aria-label="累積已實現損益走勢">'
+  return '<svg viewBox="0 0 '+W+' '+H+'" width="'+W+'" height="'+H+'" role="img" aria-label="累積已實現損益走勢">'
     + grid + zero
     + '<path d="'+area+'" fill="rgba(185,143,61,.14)"/>'
     + '<path d="'+d+'" fill="none" stroke="#B98F3D" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round"/>'
@@ -541,7 +545,7 @@ function barChartSVG(items){
   for(var i=0;i<items.length;i++) maxAbs=Math.max(maxAbs, Math.abs(items[i].value));
   if(maxAbs===0) maxAbs=1;
 
-  var out='<svg viewBox="0 0 '+W+' '+H+'" role="img" aria-label="各標的已實現損益">';
+  var out='<svg viewBox="0 0 '+W+' '+H+'" width="'+W+'" height="'+H+'" role="img" aria-label="各標的已實現損益">';
   for(var j=0;j<items.length;j++){
     var it=items[j];
     var y = PT + j*rowH;
@@ -604,8 +608,41 @@ function tradeBarSVG(trades){
     xl += '<text x="'+x.toFixed(1)+'" y="'+(H-14)+'" text-anchor="middle" font-size="10.5" fill="#5B6B60">'+esc(trades[j].sellDate.slice(5))+'</text>';
   }
 
-  return '<svg viewBox="0 0 '+W+' '+H+'" role="img" aria-label="每筆進出損益">'
+  return '<svg viewBox="0 0 '+W+' '+H+'" width="'+W+'" height="'+H+'" role="img" aria-label="每筆進出損益">'
     + grid + zero + bars + xl + '</svg>';
+}
+
+/* ---------- 圖表下載為 PNG ---------- */
+function downloadChartPNG(containerId, filename){
+  var container = document.getElementById(containerId);
+  var svg = container ? container.querySelector("svg") : null;
+  if(!svg){ toast("找不到這張圖表"); return; }
+  var w = parseInt(svg.getAttribute("width"),10) || 640;
+  var h = parseInt(svg.getAttribute("height"),10) || 220;
+  var xml = new XMLSerializer().serializeToString(svg);
+  var svg64 = btoa(unescape(encodeURIComponent(xml)));
+  var img = new Image();
+  img.onload = function(){
+    var scale = 2;
+    var canvas = document.createElement("canvas");
+    canvas.width = w*scale; canvas.height = h*scale;
+    var ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#FFFFFF";
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+    ctx.scale(scale,scale);
+    ctx.drawImage(img,0,0,w,h);
+    canvas.toBlob(function(blob){
+      if(!blob){ toast("圖片產生失敗"); return; }
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement("a");
+      a.href=url; a.download=filename;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(function(){ URL.revokeObjectURL(url); }, 1000);
+      toast("圖片已下載");
+    });
+  };
+  img.onerror = function(){ toast("圖片產生失敗"); };
+  img.src = "data:image/svg+xml;base64,"+svg64;
 }
 
 /* =======================================================================
@@ -837,8 +874,10 @@ function viewStats(L){
     }
     items.sort(function(a,b){ return b.value-a.value; });
 
-    out += '<div class="chartbox"><div class="ctitle">已實現損益走勢（累積・全部標的）</div>'+lineChartSVG(pts)+'</div>'
-      + '<div class="chartbox"><div class="ctitle">各標的已實現損益</div>'+barChartSVG(items)+'</div>';
+    out += '<div class="chartbox" id="chart_all_cum"><div class="ctitle-row"><div class="ctitle">已實現損益走勢（累積・全部標的）</div>'
+      + '<span class="dlbtn" data-dlchart="chart_all_cum" data-dlname="累積損益走勢_全部">下載 PNG</span></div>'+lineChartSVG(pts)+'</div>'
+      + '<div class="chartbox" id="chart_all_bar"><div class="ctitle-row"><div class="ctitle">各標的已實現損益</div>'
+      + '<span class="dlbtn" data-dlchart="chart_all_bar" data-dlname="各標的已實現損益">下載 PNG</span></div>'+barChartSVG(items)+'</div>';
   }else{
     var lg = L[STATE.statsFilter];
     var stock=null;
@@ -866,8 +905,11 @@ function viewStats(L){
       + (lg.holdingShares>0.001 ? ' ・ 目前持有 '+lots(lg.holdingShares) : '')
       + '</div></div>';
 
-    out += '<div class="chartbox"><div class="ctitle">累積已實現損益</div>'+lineChartSVG(tpts)+'</div>'
-      + '<div class="chartbox"><div class="ctitle">每筆進出損益</div>'+tradeBarSVG(trades)+'</div>';
+    var stockNameSafe = (stock?stock.name:"標的").replace(/[\\/:*?"<>|]/g,"");
+    out += '<div class="chartbox" id="chart_one_cum"><div class="ctitle-row"><div class="ctitle">累積已實現損益</div>'
+      + '<span class="dlbtn" data-dlchart="chart_one_cum" data-dlname="'+esc(stockNameSafe)+'_累積損益">下載 PNG</span></div>'+lineChartSVG(tpts)+'</div>'
+      + '<div class="chartbox" id="chart_one_bar"><div class="ctitle-row"><div class="ctitle">每筆進出損益</div>'
+      + '<span class="dlbtn" data-dlchart="chart_one_bar" data-dlname="'+esc(stockNameSafe)+'_每筆損益">下載 PNG</span></div>'+tradeBarSVG(trades)+'</div>';
   }
 
   return out + '</div>';
@@ -961,6 +1003,8 @@ function settingsModal(){
     + '<button class="btn btn-g btn-blk" data-act="openimport">從 Excel 貼上匯入交易</button>'
     + '<button class="btn btn-g btn-blk" data-act="openstockmanage">管理標的清單</button>'
     + '<button class="btn btn-g btn-blk" data-act="export">匯出備份檔</button>'
+    + '<button class="btn btn-g btn-blk" data-act="triggerrestore">還原備份檔</button>'
+    + '<input type="file" id="backupFileInput" accept="application/json,.json" style="display:none">'
     + '</div>';
 
   body += '<div style="margin-top:20px;padding-top:16px;border-top:1px solid var(--line)">'
@@ -1040,6 +1084,20 @@ function exportBackup(){
   toast("備份檔已下載");
 }
 
+/* ---------- 還原備份 ---------- */
+function parseBackupText(text){
+  var data;
+  try{ data = JSON.parse(text); }catch(e){ return { error:"這不是有效的 JSON 檔案，請確認選對了備份檔（.json）。" }; }
+  if(!data || typeof data!=="object") return { error:"檔案內容格式不對。" };
+  if(!Array.isArray(data.stocks) || !Array.isArray(data.txns)) return { error:"檔案裡缺少「stocks」或「txns」欄位，可能不是這個程式匯出的備份檔。" };
+  return { stocks:data.stocks, txns:data.txns, exportedAt:data.exportedAt||null };
+}
+function restoreBackup(stocks, txns){
+  STATE.stocks = stocks;
+  STATE.txns = txns;
+  commit();
+}
+
 /* ---------- Toast ---------- */
 var toastTimer=null;
 function toast(msg){
@@ -1054,7 +1112,7 @@ function toast(msg){
    事件處理
    ======================================================================= */
 document.addEventListener("click", function(e){
-  var t = e.target.closest("[data-tab],[data-act],[data-del],[data-type],[data-hmode],[data-delstock]");
+  var t = e.target.closest("[data-tab],[data-act],[data-del],[data-type],[data-hmode],[data-delstock],[data-dlchart]");
   if(!t) return;
 
   if(t.dataset.tab){
@@ -1090,6 +1148,11 @@ document.addEventListener("click", function(e){
     }
     return;
   }
+  if(t.dataset.dlchart){
+    var fname = (t.dataset.dlname || "圖表") + "_" + today() + ".png";
+    downloadChartPNG(t.dataset.dlchart, fname);
+    return;
+  }
   if(t.dataset.type && modalEl){
     modalEl.dataset.type=t.dataset.type;
     var btns=modalEl.querySelectorAll(".seg button");
@@ -1104,6 +1167,10 @@ document.addEventListener("click", function(e){
   else if(act==="opensettings") settingsModal();
   else if(act==="retrysync") startSync();
   else if(act==="export")    exportBackup();
+  else if(act==="triggerrestore"){
+    var inp = document.getElementById("backupFileInput");
+    if(inp) inp.click();
+  }
   else if(act==="togglenew"){
     var box=document.getElementById("newstock");
     box.style.display = box.style.display==="none" ? "flex" : "none";
@@ -1234,6 +1301,27 @@ document.addEventListener("change", function(e){
   if(e.target && e.target.id==="statsPick"){
     STATE.statsFilter = e.target.value;
     render();
+  }
+  if(e.target && e.target.id==="backupFileInput"){
+    var file = e.target.files && e.target.files[0];
+    if(!file) return;
+    var reader = new FileReader();
+    reader.onload = function(evt){
+      var result = parseBackupText(evt.target.result);
+      if(result.error){ alert(result.error); return; }
+      var msg = "即將還原備份檔"
+        + (result.exportedAt ? "（匯出於 "+String(result.exportedAt).slice(0,10)+"）" : "")
+        + "，內含 "+result.stocks.length+" 檔標的、"+result.txns.length+" 筆交易。\n\n"
+        + "這會覆蓋掉這台裝置目前所有的資料（"+STATE.stocks.length+" 檔標的、"+STATE.txns.length+" 筆交易），且無法復原。確定要還原嗎？";
+      if(confirm(msg)){
+        restoreBackup(result.stocks, result.txns);
+        closeModal();
+        toast("已還原備份檔");
+      }
+    };
+    reader.onerror = function(){ alert("讀取檔案失敗，請再試一次。"); };
+    reader.readAsText(file);
+    e.target.value = "";
   }
 });
 
