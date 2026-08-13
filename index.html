@@ -52,6 +52,12 @@
     transform:rotate(-8deg);flex:none;line-height:1.15;text-align:center;opacity:.85;
     font-family:"Noto Serif TC","PingFang TC",serif;}
   .chop.neg{border-color:var(--loss);color:var(--loss);}
+  .chop.neutral{border-color:var(--gold);color:var(--gold);}
+  .metriccard{cursor:pointer;user-select:none;transition:transform .08s ease;}
+  .metriccard:active{transform:scale(.985);}
+  .cyclehint{font-size:11px;color:var(--ink-soft);margin-top:9px;opacity:.75;
+    display:inline-flex;align-items:center;gap:5px;}
+  .cyclehint::before{content:"⟳";font-size:12px;}
 
   .tabs{display:flex;gap:4px;margin:18px 20px 2px;background:var(--paper-deep);border-radius:12px;padding:4px;}
   .tab{flex:1;text-align:center;padding:9px 2px;border-radius:9px;font-size:13px;font-weight:600;
@@ -245,6 +251,7 @@ var STATE = {
   statsDateFilter: { type: "all" },
   statsRangeDraftOpen: false,
   costMethod: "fifo",   // fifo 先進先出 | avg 平均成本
+  homeMetric: "realized",
   syncCode: "",
   syncStatus: "idle",   // idle | connecting | connected | error
   syncError: null
@@ -253,6 +260,7 @@ var STATE = {
 var LOCAL_KEY = "dadstock_data_v2";
 var CODE_KEY  = "dadstock_sync_code";
 var METHOD_KEY = "dadstock_cost_method";
+var METRIC_KEY = "dadstock_home_metric";
 
 function loadLocal(){
   try{
@@ -265,6 +273,8 @@ function loadLocal(){
     STATE.syncCode = localStorage.getItem(CODE_KEY) || "";
     var cm = localStorage.getItem(METHOD_KEY);
     if(cm==="fifo" || cm==="avg") STATE.costMethod = cm;
+    var hm = localStorage.getItem(METRIC_KEY);
+    if(hm) STATE.homeMetric = hm;
   }catch(e){ console.warn("本機資料讀取失敗", e); }
 }
 function saveLocal(){
@@ -849,19 +859,90 @@ function downloadChartPNG(containerId, filename){
 }
 
 /* =======================================================================
-   畫面繪製
+   首頁指標（可切換）
    ======================================================================= */
-function render(){
-  var L = allLedgers();
-  var totalRealized=0, realizedCount=0, realizedCost=0, holdingCostTotal=0, warns=[];
+function computeHomeMetrics(L){
+  var totalRealized=0, realizedCount=0, realizedCost=0, holdingCostTotal=0;
+  var wins=0, losses=0, holdingStocks=0;
+  var allRealized=[];
   for(var id in L){
     totalRealized += L[id].totalRealized;
     realizedCount += L[id].realized.length;
     realizedCost += L[id].realizedCost;
     holdingCostTotal += L[id].holdingCost;
+    if(L[id].holdingShares>0.001) holdingStocks++;
+    for(var i=0;i<L[id].realized.length;i++){
+      var r=L[id].realized[i];
+      allRealized.push(r);
+      if(r.profit>=0) wins++; else losses++;
+    }
+  }
+
+  var td = today();
+  var curYear = td.slice(0,4), curMonth = td.slice(0,7);
+  var yearProfit=0, yearCost=0, yearCount=0;
+  var monthProfit=0, monthCost=0, monthCount=0;
+  for(var j=0;j<allRealized.length;j++){
+    var rr=allRealized[j];
+    if(rr.sellDate.slice(0,4)===curYear){ yearProfit+=rr.profit; yearCost+=rr.cost; yearCount++; }
+    if(rr.sellDate.slice(0,7)===curMonth){ monthProfit+=rr.profit; monthCost+=rr.cost; monthCount++; }
+  }
+
+  var totalBought=0, buyCount=0;
+  for(var k=0;k<STATE.txns.length;k++){
+    if(STATE.txns[k].type==="buy"){ totalBought += STATE.txns[k].costWithTax; buyCount++; }
+  }
+
+  var totalRoi = realizedCost>0 ? totalRealized/realizedCost*100 : 0;
+  var winRate = realizedCount>0 ? wins/realizedCount*100 : 0;
+
+  return [
+    { key:"realized", name:"累積已實現損益",
+      value: money(totalRealized), signed:true, positive: totalRealized>=0,
+      sub: "共 "+realizedCount+" 筆已出場交易" + (realizedCost>0 ? "　投入成本 "+money(realizedCost) : ""),
+      chop: totalRealized>=0 ? "獲利<br>已實現" : "虧損<br>已實現" },
+
+    { key:"realizedRoi", name:"累積已實現報酬率",
+      value: realizedCost>0 ? pct(totalRoi) : "—", signed:true, positive: totalRealized>=0,
+      sub: realizedCost>0 ? "已實現 "+money(totalRealized)+"　投入成本 "+money(realizedCost) : "還沒有已實現的交易",
+      chop: "報酬率" },
+
+    { key:"holdingCost", name:"目前持有中的投入成本",
+      value: money(holdingCostTotal), signed:false, positive:true,
+      sub: holdingStocks>0 ? "手上有 "+holdingStocks+" 檔，損益尚未實現" : "目前沒有持有中的標的",
+      chop: "持有中" },
+
+    { key:"yearRealized", name:curYear+" 年已實現損益",
+      value: money(yearProfit), signed:true, positive: yearProfit>=0,
+      sub: yearCount+" 筆出場" + (yearCost>0 ? "　報酬率 "+pct(yearProfit/yearCost*100) : ""),
+      chop: curYear+"<br>年度" },
+
+    { key:"monthRealized", name:curYear+"年"+parseInt(curMonth.slice(5),10)+"月已實現損益",
+      value: money(monthProfit), signed:true, positive: monthProfit>=0,
+      sub: monthCount>0 ? monthCount+" 筆出場"+(monthCost>0?"　報酬率 "+pct(monthProfit/monthCost*100):"") : "這個月還沒有出場的交易",
+      chop: "本月" },
+
+    { key:"totalBought", name:"歷史累計買進總額",
+      value: money(totalBought), signed:false, positive:true,
+      sub: "共 "+buyCount+" 筆買進（含已賣出的部分）",
+      chop: "累計<br>投入" },
+
+    { key:"winRate", name:"交易勝率",
+      value: realizedCount>0 ? winRate.toFixed(0)+"%" : "—", signed:false, positive:true,
+      sub: realizedCount>0 ? realizedCount+" 次出場・賺 "+wins+" 次・賠 "+losses+" 次" : "還沒有已實現的交易",
+      chop: "勝率" }
+  ];
+}
+
+/* =======================================================================
+   畫面繪製
+   ======================================================================= */
+function render(){
+  var L = allLedgers();
+  var warns=[];
+  for(var id in L){
     warns = warns.concat(L[id].warnings);
   }
-  var totalRoi = realizedCost>0 ? totalRealized/realizedCost*100 : 0;
 
   var html = "";
 
@@ -888,21 +969,22 @@ function render(){
     + '<div class="syncbar"><span class="dot '+dotCls+'"></span><span>'+syncTxt+'</span></div>'
     + '</header>';
 
-  /* 總計卡 */
-  html += '<div class="stamp"><div>'
-    + '<div class="label">累積已實現損益</div>'
-    + '<div class="value num '+(totalRealized>=0?"gain":"loss")+'">'+money(totalRealized)
-    + (realizedCost>0 ? ' <span style="font-size:15px">'+pct(totalRoi)+'</span>' : '')+'</div>'
-    + '<div class="foot">共 '+realizedCount+' 筆已出場交易'
-    + (realizedCost>0 ? '　投入成本 '+money(realizedCost) : '')+'</div>'
-    + '</div><div class="chop '+(totalRealized>=0?"":"neg")+'">'+(totalRealized>=0?"獲利<br>已實現":"虧損<br>已實現")+'</div></div>';
+  /* 總計卡（可切換指標） */
+  var metrics = computeHomeMetrics(L);
+  var mIdx = 0;
+  for(var mi=0; mi<metrics.length; mi++){ if(metrics[mi].key===STATE.homeMetric) mIdx = mi; }
+  var M = metrics[mIdx];
+  var valCls = M.signed ? (M.positive?"gain":"loss") : "";
+  var chopCls = M.signed ? (M.positive?"":"neg") : "neutral";
 
-  if(holdingCostTotal>0){
-    html += '<div class="stamp" style="padding:16px 20px">'
-      + '<div><div class="label">目前持有中的投入成本</div>'
-      + '<div style="font-size:21px;font-weight:700" class="num">'+money(holdingCostTotal)+'</div>'
-      + '<div class="foot">尚未賣出，這部分損益還沒實現</div></div></div>';
-  }
+  html += '<div class="stamp metriccard" data-act="cyclemetric" role="button" tabindex="0">'
+    + '<div style="flex:1;min-width:0">'
+    + '<div class="label">'+esc(M.name)+'</div>'
+    + '<div class="value num '+valCls+'">'+M.value+'</div>'
+    + '<div class="foot">'+M.sub+'</div>'
+    + '<div class="cyclehint">輕觸切換　'+(mIdx+1)+' / '+metrics.length+'</div>'
+    + '</div>'
+    + '<div class="chop '+chopCls+'">'+M.chop+'</div></div>';
 
   if(warns.length>0){
     html += '<div class="warn">⚠ 有 '+warns.length+' 筆資料配對異常，請到「歷史紀錄」確認是否漏記買進。</div>';
@@ -1383,6 +1465,18 @@ function settingsModal(){
   body += '<div class="srow" style="margin-top:18px"><span class="muted">交易筆數</span><span>'+STATE.txns.length+' 筆</span></div>'
     + '<div class="srow"><span class="muted">標的數</span><span>'+STATE.stocks.length+' 檔</span></div>';
 
+  var metricList = computeHomeMetrics(allLedgers());
+  var metricOpts = "";
+  for(var mo=0; mo<metricList.length; mo++){
+    metricOpts += '<option value="'+metricList[mo].key+'"'
+      + (STATE.homeMetric===metricList[mo].key?" selected":"")+'>'+esc(metricList[mo].name)+'</option>';
+  }
+  body += '<div style="margin-top:18px;padding-top:16px;border-top:1px solid var(--line)">'
+    + '<div class="field" style="margin-bottom:6px"><label>首頁最上面那張卡要顯示什麼</label>'
+    + '<select id="homeMetricSelect">'+metricOpts+'</select></div>'
+    + '<div class="muted" style="font-size:11.5px">在首頁直接輕觸那張卡片，也可以快速切換到下一個。</div>'
+    + '</div>';
+
   var isFifo = (STATE.costMethod||"fifo")==="fifo";
   body += '<div style="margin-top:18px;padding-top:16px;border-top:1px solid var(--line)">'
     + '<div class="muted" style="margin-bottom:8px">賣出時，成本要怎麼算？</div>'
@@ -1508,6 +1602,11 @@ function tutorialModal(){
     + '• <b>平均成本</b>：用手上全部股票的平均成本算，不分先後</p>'
     + '<p '+S+'>差別只在「這次認列多少、剩下的留到以後認列多少」，等全部賣完，總數還是一樣。'
     + '在「設定」裡隨時可以切換，切換不會動到任何一筆紀錄。</p>'
+
+    + '<div '+H+'>首頁最上面那張卡</div>'
+    + '<p '+S+'>那張卡可以<b>輕輕點一下就換下一個數字</b>看，總共有七種：累積賺賠、報酬率、'
+    + '目前壓在股票上的錢、今年賺賠、這個月賺賠、從頭到現在總共買了多少錢、還有勝率（賺的次數佔幾成）。'
+    + '卡片右下角會顯示現在是第幾個。想固定看某一個，也可以去「設定」裡選。</p>'
 
     + '<div '+H+'>三個頁籤分別在看什麼</div>'
     + '<p '+S+'>• <b>持有中</b>：現在手上還沒賣掉的股票，有多少張、平均成本多少<br>'
@@ -1818,6 +1917,15 @@ document.addEventListener("click", function(e){
       toast("輸入不符，已取消");
     }
   }
+  else if(act==="cyclemetric"){
+    var ms = computeHomeMetrics(allLedgers());
+    var cur = 0;
+    for(var ci=0; ci<ms.length; ci++){ if(ms[ci].key===STATE.homeMetric) cur = ci; }
+    var next = ms[(cur+1) % ms.length];
+    STATE.homeMetric = next.key;
+    localStorage.setItem(METRIC_KEY, STATE.homeMetric);
+    render();
+  }
   else if(act==="opentutorial") tutorialModal();
   else if(act==="openimport") importModal();
   else if(act==="parseimport"){
@@ -1865,6 +1973,11 @@ document.addEventListener("click", function(e){
 document.addEventListener("change", function(e){
   if(e.target && e.target.id==="statsPick"){
     STATE.statsFilter = e.target.value;
+    render();
+  }
+  if(e.target && e.target.id==="homeMetricSelect"){
+    STATE.homeMetric = e.target.value;
+    localStorage.setItem(METRIC_KEY, STATE.homeMetric);
     render();
   }
   if(e.target && (e.target.id==="historyRangeSelect" || e.target.id==="statsRangeSelect")){
